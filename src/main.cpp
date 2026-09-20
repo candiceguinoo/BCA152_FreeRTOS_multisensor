@@ -3,6 +3,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "driver/gpio.h"
 #include "esp_timer.h"
@@ -15,6 +16,19 @@
 // LDR is connected to GPIO 34
 // GPIO 34 = ADC1_CHANNEL_6
 #define LDR_CHANNEL ADC_CHANNEL_6
+
+// ----------------------------------------------------
+// Sensor Data Structure
+// ----------------------------------------------------
+struct SensorData {
+    float temperature;
+    float humidity;
+    int lightLevel;
+    bool motionDetected;
+};
+
+// Sensor Queue
+QueueHandle_t sensorQueue;
 
 // ----------------------------------------------------
 // DHT22 reading function
@@ -158,15 +172,21 @@ void sensorTask(void *parameter)
         &adc_config
     );
 
+    // Used for periodic execution
     TickType_t lastWakeTime = xTaskGetTickCount();
 
     while (1)
     {
+        SensorData sensorData;
+
         // --------------------------------------------
         // Read DHT22
         // --------------------------------------------
         if (dht22_read(&temperature, &humidity))
         {
+            sensorData.temperature = temperature;
+            sensorData.humidity = humidity;
+
             printf("Temperature: %.2f C\n",
                    temperature);
 
@@ -176,6 +196,9 @@ void sensorTask(void *parameter)
         else
         {
             printf("DHT22 reading failed\n");
+
+            sensorData.temperature = 0;
+            sensorData.humidity = 0;
         }
 
         // --------------------------------------------
@@ -195,12 +218,36 @@ void sensorTask(void *parameter)
             float light_percent =
                 (raw_ldr / 4095.0f) * 100.0f;
 
+            sensorData.lightLevel =
+                (int)light_percent;
+
             printf("Light: %.2f %%\n",
                    light_percent);
         }
         else
         {
             printf("LDR reading failed\n");
+
+            sensorData.lightLevel = 0;
+        }
+
+        // Motion sensor will be added later
+        sensorData.motionDetected = false;
+
+        // --------------------------------------------
+        // Send Sensor Data to Queue
+        // --------------------------------------------
+        if (xQueueSend(
+                sensorQueue,
+                &sensorData,
+                pdMS_TO_TICKS(100)
+            ) == pdPASS)
+        {
+            printf("Sensor data sent to queue\n");
+        }
+        else
+        {
+            printf("Failed to send sensor data to queue\n");
         }
 
         printf("SensorTask waiting 2 sec\n");
@@ -230,7 +277,25 @@ extern "C" void app_main(void)
 
     gpio_pullup_en(DHT_PIN);
 
+    // --------------------------------------------
+    // Create Sensor Queue
+    // --------------------------------------------
+    sensorQueue = xQueueCreate(
+        5,
+        sizeof(SensorData)
+    );
+
+    if (sensorQueue == NULL)
+    {
+        printf("Failed to create sensor queue\n");
+        return;
+    }
+
+    printf("Sensor queue created successfully\n");
+
+    // --------------------------------------------
     // Create SensorTask
+    // --------------------------------------------
     xTaskCreate(
         sensorTask,
         "SensorTask",
