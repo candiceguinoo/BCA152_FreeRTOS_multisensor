@@ -2,7 +2,26 @@
   "version": 1,
   "author": "Candice GUINOO",
   "editor": "wokwi",
-  "parts": [ { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} } ],
-  "connections": [ [ "esp:TX", "$serialMonitor:RX", "", [] ], [ "esp:RX", "$serialMonitor:TX", "", [] ] ],
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": -4.76, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht1", "top": 38.7, "left": -149.4, "attrs": {} },
+    {
+      "type": "wokwi-photoresistor-sensor",
+      "id": "ldr1",
+      "top": 51.2,
+      "left": 135.2,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "dht1:GND", "esp:GND.1", "black", [ "v0" ] ],
+    [ "dht1:SDA", "esp:4", "green", [ "v76.8", "h249.7", "v-86.4", "h-28.8" ] ],
+    [ "dht1:VCC", "esp:3V3", "red", [ "v0", "h-28.8", "v-124.8" ] ],
+    [ "ldr1:AO", "esp:34", "green", [ "h28.8", "v-106.3", "h-355.2", "v76.8" ] ],
+    [ "ldr1:GND", "esp:GND.2", "black", [ "h19.2", "v-48.4" ] ],
+    [ "ldr1:VCC", "esp:3V3", "red", [ "h9.6", "v-96", "h-316.8" ] ]
+  ],
   "dependencies": {}
 }
