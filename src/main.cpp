@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -49,7 +50,6 @@
 // TIMING SETTINGS
 // ====================================================
 
-// Laboratory testing value for inactivity timeout
 #define INACTIVITY_TIMEOUT_US 15000000LL
 
 // ====================================================
@@ -70,12 +70,41 @@ enum class DisplayMode
     MOTION
 };
 
-// System state machine
 enum class SystemState
 {
     ACTIVE,
     INACTIVE
 };
+
+// ====================================================
+// EVENT GROUP
+// ====================================================
+//
+// EVENT_ACTIVE:
+//     Producer: MotionTask
+//     Consumers: DisplayTask, InputTask, AlarmTask
+//     Set: PIR detects motion
+//     Clear: 15-second inactivity timeout
+//
+// EVENT_MOTION:
+//     Producer: MotionTask
+//     Consumer: DisplayTask
+//     Set: PIR detects motion
+//     Clear: 15-second inactivity timeout
+//
+// EVENT_ALARM:
+//     Producer: AlarmTask
+//     Consumer: DisplayTask
+//     Set: LOW or HIGH temperature
+//     Clear: NORMAL temperature
+//
+// ====================================================
+
+#define EVENT_ACTIVE BIT0
+#define EVENT_MOTION BIT1
+#define EVENT_ALARM  BIT2
+
+EventGroupHandle_t systemEvents;
 
 // ====================================================
 // SENSOR DATA
@@ -88,6 +117,27 @@ struct SensorData
     int lightLevel;
     bool motionDetected;
 };
+
+// ====================================================
+// ALARM STRING HELPER
+// ====================================================
+
+static const char *alarmStateToString(AlarmState state)
+{
+    switch (state)
+    {
+        case AlarmState::NORMAL:
+            return "NORMAL";
+
+        case AlarmState::LOW_TEMPERATURE:
+            return "LOW_TEMPERATURE";
+
+        case AlarmState::HIGH_TEMPERATURE:
+            return "HIGH_TEMPERATURE";
+    }
+
+    return "UNKNOWN";
+}
 
 // ====================================================
 // DISPLAY MODE HELPERS
@@ -154,27 +204,6 @@ static const char *modeToString(DisplayMode mode)
 }
 
 // ====================================================
-// ALARM STRING HELPER
-// ====================================================
-
-static const char *alarmStateToString(AlarmState state)
-{
-    switch (state)
-    {
-        case AlarmState::NORMAL:
-            return "NORMAL";
-
-        case AlarmState::LOW_TEMPERATURE:
-            return "LOW_TEMPERATURE";
-
-        case AlarmState::HIGH_TEMPERATURE:
-            return "HIGH_TEMPERATURE";
-    }
-
-    return "UNKNOWN";
-}
-
-// ====================================================
 // QUEUES
 // ====================================================
 
@@ -190,15 +219,15 @@ QueueHandle_t encoderQueue;
 // SYSTEM STATE
 // ====================================================
 
-volatile SystemState systemState = SystemState::ACTIVE;
+volatile SystemState systemState =
+    SystemState::ACTIVE;
+
 volatile bool motionDetected = false;
 
 // ====================================================
 // HELPERS
 // ====================================================
 
-// pdMS_TO_TICKS() can round very small values down to 0.
-// This helper guarantees that a task blocks for at least one tick.
 static inline TickType_t ms_to_ticks(uint32_t ms)
 {
     TickType_t ticks = pdMS_TO_TICKS(ms);
@@ -228,11 +257,7 @@ static void report_i2c_error(esp_err_t err)
 
 static void oled_command(uint8_t command)
 {
-    uint8_t data[2] =
-    {
-        0x00,
-        command
-    };
+    uint8_t data[2] = {0x00, command};
 
     esp_err_t err =
         i2c_master_write_to_device(
@@ -376,177 +401,57 @@ static void oled_set_cursor(
 // OLED CHARACTER FONT
 // ====================================================
 
-static void get_glyph(
-    char c,
-    uint8_t p[6]
-)
+static void get_glyph(char c, uint8_t p[6])
 {
     for (int i = 0; i < 6; i++)
         p[i] = 0;
 
     switch (c)
     {
-        case 'A':
-            p[0]=0x7E; p[1]=0x11; p[2]=0x11; p[3]=0x11; p[4]=0x7E;
-            break;
+        case 'A': p[0]=0x7E; p[1]=0x11; p[2]=0x11; p[3]=0x11; p[4]=0x7E; break;
+        case 'B': p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36; break;
+        case 'C': p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x22; break;
+        case 'D': p[0]=0x7F; p[1]=0x41; p[2]=0x41; p[3]=0x22; p[4]=0x1C; break;
+        case 'E': p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x41; break;
+        case 'F': p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x01; break;
+        case 'G': p[0]=0x3E; p[1]=0x41; p[2]=0x49; p[3]=0x49; p[4]=0x7A; break;
+        case 'H': p[0]=0x7F; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x7F; break;
+        case 'I': p[0]=0x00; p[1]=0x41; p[2]=0x7F; p[3]=0x41; p[4]=0x00; break;
+        case 'J': p[0]=0x20; p[1]=0x40; p[2]=0x41; p[3]=0x3F; p[4]=0x01; break;
+        case 'K': p[0]=0x7F; p[1]=0x08; p[2]=0x14; p[3]=0x22; p[4]=0x41; break;
+        case 'L': p[0]=0x7F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x40; break;
+        case 'M': p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x02; p[4]=0x7F; break;
+        case 'N': p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x18; p[4]=0x7F; break;
+        case 'O': p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x3E; break;
+        case 'P': p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x06; break;
+        case 'Q': p[0]=0x3E; p[1]=0x41; p[2]=0x51; p[3]=0x21; p[4]=0x5E; break;
+        case 'R': p[0]=0x7F; p[1]=0x09; p[2]=0x19; p[3]=0x29; p[4]=0x46; break;
+        case 'S': p[0]=0x46; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x31; break;
+        case 'T': p[0]=0x01; p[1]=0x01; p[2]=0x7F; p[3]=0x01; p[4]=0x01; break;
+        case 'U': p[0]=0x3F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x3F; break;
+        case 'V': p[0]=0x1F; p[1]=0x20; p[2]=0x40; p[3]=0x20; p[4]=0x1F; break;
+        case 'W': p[0]=0x7F; p[1]=0x20; p[2]=0x18; p[3]=0x20; p[4]=0x7F; break;
+        case 'X': p[0]=0x63; p[1]=0x14; p[2]=0x08; p[3]=0x14; p[4]=0x63; break;
+        case 'Y': p[0]=0x07; p[1]=0x08; p[2]=0x70; p[3]=0x08; p[4]=0x07; break;
+        case 'Z': p[0]=0x61; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x43; break;
 
-        case 'B':
-            p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36;
-            break;
+        case '0': p[0]=0x3E; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x3E; break;
+        case '1': p[0]=0x00; p[1]=0x42; p[2]=0x7F; p[3]=0x40; p[4]=0x00; break;
+        case '2': p[0]=0x42; p[1]=0x61; p[2]=0x51; p[3]=0x49; p[4]=0x46; break;
+        case '3': p[0]=0x21; p[1]=0x41; p[2]=0x45; p[3]=0x4B; p[4]=0x31; break;
+        case '4': p[0]=0x18; p[1]=0x14; p[2]=0x12; p[3]=0x7F; p[4]=0x10; break;
+        case '5': p[0]=0x27; p[1]=0x45; p[2]=0x45; p[3]=0x45; p[4]=0x39; break;
+        case '6': p[0]=0x3C; p[1]=0x4A; p[2]=0x49; p[3]=0x49; p[4]=0x30; break;
+        case '7': p[0]=0x01; p[1]=0x71; p[2]=0x09; p[3]=0x05; p[4]=0x03; break;
+        case '8': p[0]=0x36; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36; break;
+        case '9': p[0]=0x06; p[1]=0x49; p[2]=0x49; p[3]=0x29; p[4]=0x1E; break;
 
-        case 'C':
-            p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x22;
-            break;
+        case '%': p[0]=0x63; p[1]=0x13; p[2]=0x08; p[3]=0x64; p[4]=0x63; break;
+        case '.': p[0]=0x00; p[1]=0x60; p[2]=0x60; p[3]=0x00; p[4]=0x00; break;
+        case '-': p[0]=0x08; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x08; break;
+        case ' ': break;
 
-        case 'D':
-            p[0]=0x7F; p[1]=0x41; p[2]=0x41; p[3]=0x22; p[4]=0x1C;
-            break;
-
-        case 'E':
-            p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x41;
-            break;
-
-        case 'F':
-            p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x01;
-            break;
-
-        case 'G':
-            p[0]=0x3E; p[1]=0x41; p[2]=0x49; p[3]=0x49; p[4]=0x7A;
-            break;
-
-        case 'H':
-            p[0]=0x7F; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x7F;
-            break;
-
-        case 'I':
-            p[0]=0x00; p[1]=0x41; p[2]=0x7F; p[3]=0x41; p[4]=0x00;
-            break;
-
-        case 'J':
-            p[0]=0x20; p[1]=0x40; p[2]=0x41; p[3]=0x3F; p[4]=0x01;
-            break;
-
-        case 'K':
-            p[0]=0x7F; p[1]=0x08; p[2]=0x14; p[3]=0x22; p[4]=0x41;
-            break;
-
-        case 'L':
-            p[0]=0x7F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x40;
-            break;
-
-        case 'M':
-            p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x02; p[4]=0x7F;
-            break;
-
-        case 'N':
-            p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x18; p[4]=0x7F;
-            break;
-
-        case 'O':
-            p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x3E;
-            break;
-
-        case 'P':
-            p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x06;
-            break;
-
-        case 'Q':
-            p[0]=0x3E; p[1]=0x41; p[2]=0x51; p[3]=0x21; p[4]=0x5E;
-            break;
-
-        case 'R':
-            p[0]=0x7F; p[1]=0x09; p[2]=0x19; p[3]=0x29; p[4]=0x46;
-            break;
-
-        case 'S':
-            p[0]=0x46; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x31;
-            break;
-
-        case 'T':
-            p[0]=0x01; p[1]=0x01; p[2]=0x7F; p[3]=0x01; p[4]=0x01;
-            break;
-
-        case 'U':
-            p[0]=0x3F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x3F;
-            break;
-
-        case 'V':
-            p[0]=0x1F; p[1]=0x20; p[2]=0x40; p[3]=0x20; p[4]=0x1F;
-            break;
-
-        case 'W':
-            p[0]=0x7F; p[1]=0x20; p[2]=0x18; p[3]=0x20; p[4]=0x7F;
-            break;
-
-        case 'X':
-            p[0]=0x63; p[1]=0x14; p[2]=0x08; p[3]=0x14; p[4]=0x63;
-            break;
-
-        case 'Y':
-            p[0]=0x07; p[1]=0x08; p[2]=0x70; p[3]=0x08; p[4]=0x07;
-            break;
-
-        case 'Z':
-            p[0]=0x61; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x43;
-            break;
-
-        case '0':
-            p[0]=0x3E; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x3E;
-            break;
-
-        case '1':
-            p[0]=0x00; p[1]=0x42; p[2]=0x7F; p[3]=0x40; p[4]=0x00;
-            break;
-
-        case '2':
-            p[0]=0x42; p[1]=0x61; p[2]=0x51; p[3]=0x49; p[4]=0x46;
-            break;
-
-        case '3':
-            p[0]=0x21; p[1]=0x41; p[2]=0x45; p[3]=0x4B; p[4]=0x31;
-            break;
-
-        case '4':
-            p[0]=0x18; p[1]=0x14; p[2]=0x12; p[3]=0x7F; p[4]=0x10;
-            break;
-
-        case '5':
-            p[0]=0x27; p[1]=0x45; p[2]=0x45; p[3]=0x45; p[4]=0x39;
-            break;
-
-        case '6':
-            p[0]=0x3C; p[1]=0x4A; p[2]=0x49; p[3]=0x49; p[4]=0x30;
-            break;
-
-        case '7':
-            p[0]=0x01; p[1]=0x71; p[2]=0x09; p[3]=0x05; p[4]=0x03;
-            break;
-
-        case '8':
-            p[0]=0x36; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36;
-            break;
-
-        case '9':
-            p[0]=0x06; p[1]=0x49; p[2]=0x49; p[3]=0x29; p[4]=0x1E;
-            break;
-
-        case '%':
-            p[0]=0x63; p[1]=0x13; p[2]=0x08; p[3]=0x64; p[4]=0x63;
-            break;
-
-        case '.':
-            p[0]=0x00; p[1]=0x60; p[2]=0x60; p[3]=0x00; p[4]=0x00;
-            break;
-
-        case '-':
-            p[0]=0x08; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x08;
-            break;
-
-        case ' ':
-            break;
-
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -644,14 +549,7 @@ static bool dht22_read(
     float *humidity
 )
 {
-    uint8_t data[5] =
-    {
-        0,
-        0,
-        0,
-        0,
-        0
-    };
+    uint8_t data[5] = {0, 0, 0, 0, 0};
 
     bool success = false;
 
@@ -988,10 +886,6 @@ void sensorTask(void *parameter)
 
     while (1)
     {
-        // --------------------------------------------
-        // DHT22
-        // --------------------------------------------
-
         float newTemperature = 0.0f;
         float newHumidity = 0.0f;
 
@@ -1029,10 +923,6 @@ void sensorTask(void *parameter)
             }
         }
 
-        // --------------------------------------------
-        // LDR
-        // --------------------------------------------
-
         int raw_value = 0;
 
         result =
@@ -1061,16 +951,8 @@ void sensorTask(void *parameter)
             sensorData.lightLevel = 0;
         }
 
-        // --------------------------------------------
-        // MOTION STATE
-        // --------------------------------------------
-
         sensorData.motionDetected =
             motionDetected;
-
-        // --------------------------------------------
-        // SERIAL OUTPUT
-        // --------------------------------------------
 
         printf(
             "Temperature: %.2f C\n",
@@ -1121,11 +1003,6 @@ void sensorTask(void *parameter)
 // ====================================================
 // MOTION TASK
 // ====================================================
-//
-// ACTIVE   -- no motion for 15 seconds --> INACTIVE
-// INACTIVE -- motion detected ---------> ACTIVE
-//
-// ====================================================
 
 void motionTask(void *parameter)
 {
@@ -1154,15 +1031,17 @@ void motionTask(void *parameter)
         int64_t now =
             esp_timer_get_time();
 
-        // --------------------------------------------
-        // PIR ACTIVITY
-        // --------------------------------------------
-
         if (pirLevel)
         {
             lastMotionTime = now;
 
             motionDetected = true;
+
+            // Part X: set ACTIVE + MOTION events
+            xEventGroupSetBits(
+                systemEvents,
+                EVENT_ACTIVE | EVENT_MOTION
+            );
 
             if (!lastPirLevel)
             {
@@ -1171,7 +1050,10 @@ void motionTask(void *parameter)
                 );
             }
 
-            if (systemState == SystemState::INACTIVE)
+            if (
+                systemState ==
+                SystemState::INACTIVE
+            )
             {
                 systemState =
                     SystemState::ACTIVE;
@@ -1185,10 +1067,6 @@ void motionTask(void *parameter)
         lastPirLevel =
             pirLevel;
 
-        // --------------------------------------------
-        // INACTIVITY TIMEOUT
-        // --------------------------------------------
-
         if (
             systemState == SystemState::ACTIVE &&
             (now - lastMotionTime)
@@ -1199,6 +1077,12 @@ void motionTask(void *parameter)
 
             systemState =
                 SystemState::INACTIVE;
+
+            // Part X: clear ACTIVE + MOTION events
+            xEventGroupClearBits(
+                systemEvents,
+                EVENT_ACTIVE | EVENT_MOTION
+            );
 
             printf(
                 "MotionTask: NO MOTION - "
@@ -1318,7 +1202,14 @@ void inputTask(void *parameter)
             ) == pdPASS
         )
         {
-            if (systemState == SystemState::ACTIVE)
+            // Part X: read ACTIVE event
+            EventBits_t events =
+                xEventGroupGetBits(systemEvents);
+
+            bool active =
+                (events & EVENT_ACTIVE) != 0;
+
+            if (active)
             {
                 if (direction > 0)
                 {
@@ -1351,10 +1242,17 @@ void inputTask(void *parameter)
         bool currentButton =
             gpio_get_level(ENCODER_SW);
 
+        // Read ACTIVE event before accepting button input
+        EventBits_t events =
+            xEventGroupGetBits(systemEvents);
+
+        bool active =
+            (events & EVENT_ACTIVE) != 0;
+
         if (
             lastButton == 1 &&
             currentButton == 0 &&
-            systemState == SystemState::ACTIVE
+            active
         )
         {
             currentMode =
@@ -1518,10 +1416,6 @@ static void drawPage(
 // ====================================================
 // DISPLAY TASK
 // ====================================================
-//
-// DisplayTask is the ONLY task that accesses the OLED.
-//
-// ====================================================
 
 void displayTask(void *parameter)
 {
@@ -1534,6 +1428,7 @@ void displayTask(void *parameter)
     bool displayOn = true;
     bool needRedraw = true;
     bool lastMotionShown = false;
+    bool lastAlarmShown = false;
 
     oled_init();
     oled_clear();
@@ -1567,22 +1462,35 @@ void displayTask(void *parameter)
             ) == pdPASS
         )
         {
-            currentMode =
-                newMode;
-
+            currentMode = newMode;
             needRedraw = true;
         }
+
+        // --------------------------------------------
+        // PART X - READ EVENT GROUP
+        // --------------------------------------------
+
+        EventBits_t events =
+            xEventGroupGetBits(systemEvents);
+
+        bool active =
+            (events & EVENT_ACTIVE) != 0;
+
+        bool motion =
+            (events & EVENT_MOTION) != 0;
+
+        bool alarm =
+            (events & EVENT_ALARM) != 0;
 
         // --------------------------------------------
         // INACTIVE
         // --------------------------------------------
 
-        if (systemState != SystemState::ACTIVE)
+        if (!active)
         {
             if (displayOn)
             {
                 oled_clear();
-
                 oled_power(false);
 
                 displayOn = false;
@@ -1605,7 +1513,6 @@ void displayTask(void *parameter)
             oled_power(true);
 
             displayOn = true;
-
             needRedraw = true;
 
             printf(
@@ -1616,19 +1523,28 @@ void displayTask(void *parameter)
 
         if (
             currentMode == DisplayMode::MOTION &&
-            motionDetected != lastMotionShown
+            motion != lastMotionShown
         )
         {
             needRedraw = true;
+        }
+
+        // Alarm event is consumed here.
+        if (alarm != lastAlarmShown)
+        {
+            lastAlarmShown = alarm;
+
+            printf(
+                "DisplayTask: Alarm event = %s\n",
+                alarm ? "ACTIVE" : "CLEAR"
+            );
         }
 
         if (!haveData || !needRedraw)
             continue;
 
         needRedraw = false;
-
-        lastMotionShown =
-            motionDetected;
+        lastMotionShown = motion;
 
         drawPage(
             currentMode,
@@ -1639,12 +1555,6 @@ void displayTask(void *parameter)
 
 // ====================================================
 // ALARM TASK
-// ====================================================
-//
-// evaluateTemperature() is implemented in alarm.cpp.
-// This task only consumes sensor data and reacts to the
-// resulting AlarmState.
-//
 // ====================================================
 
 void alarmTask(void *parameter)
@@ -1671,16 +1581,59 @@ void alarmTask(void *parameter)
             ) == pdPASS
         )
         {
-            if (systemState != SystemState::ACTIVE)
+            // ----------------------------------------
+            // READ ACTIVE EVENT
+            // ----------------------------------------
+
+            EventBits_t events =
+                xEventGroupGetBits(systemEvents);
+
+            bool active =
+                (events & EVENT_ACTIVE) != 0;
+
+            if (!active)
             {
+                xEventGroupClearBits(
+                    systemEvents,
+                    EVENT_ALARM
+                );
+
                 firstEvaluation = true;
+
                 continue;
             }
+
+            // ----------------------------------------
+            // TEMPERATURE DECISION
+            // ----------------------------------------
 
             AlarmState state =
                 evaluateTemperature(
                     sensorData.temperature
                 );
+
+            // ----------------------------------------
+            // SET/CLEAR ALARM EVENT
+            // ----------------------------------------
+
+            if (state != AlarmState::NORMAL)
+            {
+                xEventGroupSetBits(
+                    systemEvents,
+                    EVENT_ALARM
+                );
+            }
+            else
+            {
+                xEventGroupClearBits(
+                    systemEvents,
+                    EVENT_ALARM
+                );
+            }
+
+            // ----------------------------------------
+            // LOG STATE CHANGE
+            // ----------------------------------------
 
             if (
                 firstEvaluation ||
@@ -1693,13 +1646,10 @@ void alarmTask(void *parameter)
                     sensorData.temperature
                 );
 
-                // Buzzer hardware control can be added here.
+                // Buzzer hardware control would go here.
 
-                lastState =
-                    state;
-
-                firstEvaluation =
-                    false;
+                lastState = state;
+                firstEvaluation = false;
             }
         }
     }
@@ -1797,13 +1747,41 @@ extern "C" void app_main(void)
         "Queues created successfully.\n"
     );
 
-    BaseType_t result;
+    // --------------------------------------------
+    // CREATE EVENT GROUP
+    // --------------------------------------------
+
+    systemEvents =
+        xEventGroupCreate();
+
+    if (systemEvents == NULL)
+    {
+        printf(
+            "ERROR: Failed to create event group\n"
+        );
+
+        return;
+    }
+
+    printf(
+        "Event group created successfully.\n"
+    );
+
+    // Initial system state is ACTIVE.
+    xEventGroupSetBits(
+        systemEvents,
+        EVENT_ACTIVE
+    );
+
+    printf(
+        "Initial event: EVENT_ACTIVE\n"
+    );
 
     // --------------------------------------------
     // SENSOR TASK - CPU0
     // --------------------------------------------
 
-    result =
+    BaseType_t result =
         xTaskCreatePinnedToCore(
             sensorTask,
             "SensorTask",
@@ -1921,5 +1899,21 @@ extern "C" void app_main(void)
 
     printf(
         "All tasks started successfully.\n"
+    );
+
+    printf(
+        "Part X Event Group initialized.\n"
+    );
+
+    printf(
+        "EVENT_ACTIVE = BIT0\n"
+    );
+
+    printf(
+        "EVENT_MOTION = BIT1\n"
+    );
+
+    printf(
+        "EVENT_ALARM  = BIT2\n"
     );
 }
