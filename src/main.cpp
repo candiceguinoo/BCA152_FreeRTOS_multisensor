@@ -1,11 +1,15 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+
+#include "alarm.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -14,8 +18,6 @@
 #include "esp_rom_sys.h"
 #include "esp_attr.h"
 #include "esp_err.h"
-
-#include "alarm.h"
 
 // ====================================================
 // PIN DEFINITIONS
@@ -77,36 +79,6 @@ enum class SystemState
 };
 
 // ====================================================
-// EVENT GROUP
-// ====================================================
-//
-// EVENT_ACTIVE:
-//     Producer: MotionTask
-//     Consumers: DisplayTask, InputTask, AlarmTask
-//     Set: PIR detects motion
-//     Clear: 15-second inactivity timeout
-//
-// EVENT_MOTION:
-//     Producer: MotionTask
-//     Consumer: DisplayTask
-//     Set: PIR detects motion
-//     Clear: 15-second inactivity timeout
-//
-// EVENT_ALARM:
-//     Producer: AlarmTask
-//     Consumer: DisplayTask
-//     Set: LOW or HIGH temperature
-//     Clear: NORMAL temperature
-//
-// ====================================================
-
-#define EVENT_ACTIVE BIT0
-#define EVENT_MOTION BIT1
-#define EVENT_ALARM  BIT2
-
-EventGroupHandle_t systemEvents;
-
-// ====================================================
 // SENSOR DATA
 // ====================================================
 
@@ -119,7 +91,7 @@ struct SensorData
 };
 
 // ====================================================
-// ALARM STRING HELPER
+// ALARM
 // ====================================================
 
 static const char *alarmStateToString(AlarmState state)
@@ -212,16 +184,46 @@ QueueHandle_t alarmQueue;
 QueueHandle_t modeQueue;
 QueueHandle_t encoderQueue;
 
-// +1 = clockwise
-// -1 = counter-clockwise
+// ====================================================
+// SERIAL MUTEX - Part XI
+// ====================================================
+
+SemaphoreHandle_t serialMutex = NULL;
+
+// ====================================================
+// EVENT GROUP - Part X
+// ====================================================
+//
+// EVENT_ACTIVE:
+//     Producer: app_main / MotionTask
+//     Consumers: DisplayTask / InputTask / AlarmTask
+//     Set: system startup or motion detected
+//     Clear: 15-second inactivity timeout
+//
+// EVENT_MOTION:
+//     Producer: MotionTask
+//     Consumer: DisplayTask
+//     Set: PIR detects motion
+//     Clear: 15-second inactivity timeout
+//
+// EVENT_ALARM:
+//     Producer: AlarmTask
+//     Consumer: DisplayTask
+//     Set: LOW_TEMPERATURE or HIGH_TEMPERATURE
+//     Clear: NORMAL temperature or system inactive
+//
+
+#define EVENT_ACTIVE BIT0
+#define EVENT_MOTION BIT1
+#define EVENT_ALARM  BIT2
+
+EventGroupHandle_t systemEvents = NULL;
 
 // ====================================================
 // SYSTEM STATE
 // ====================================================
 
-volatile SystemState systemState =
-    SystemState::ACTIVE;
-
+volatile SystemState systemState = SystemState::ACTIVE;
 volatile bool motionDetected = false;
 
 // ====================================================
@@ -236,6 +238,32 @@ static inline TickType_t ms_to_ticks(uint32_t ms)
 }
 
 // ====================================================
+// SERIAL OUTPUT HELPER
+// ====================================================
+
+static void serialPrintf(const char *format, ...)
+{
+    va_list args;
+
+    va_start(args, format);
+
+    if (
+        serialMutex != NULL &&
+        xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE
+    )
+    {
+        vprintf(format, args);
+        xSemaphoreGive(serialMutex);
+    }
+    else
+    {
+        vprintf(format, args);
+    }
+
+    va_end(args);
+}
+
+// ====================================================
 // OLED
 // ====================================================
 
@@ -247,7 +275,7 @@ static void report_i2c_error(esp_err_t err)
     {
         i2cErrorLogged = true;
 
-        printf(
+        serialPrintf(
             "OLED I2C error: %s "
             "(check SDA=21, SCL=22, address 0x3C)\n",
             esp_err_to_name(err)
@@ -271,10 +299,7 @@ static void oled_command(uint8_t command)
     report_i2c_error(err);
 }
 
-static void oled_data(
-    const uint8_t *data,
-    size_t length
-)
+static void oled_data(const uint8_t *data, size_t length)
 {
     uint8_t buffer[129];
 
@@ -309,32 +334,27 @@ static void oled_init()
     config.scl_pullup_en = GPIO_PULLUP_ENABLE;
     config.master.clk_speed = 400000;
 
-    esp_err_t err =
-        i2c_param_config(
-            I2C_PORT,
-            &config
-        );
+    esp_err_t err = i2c_param_config(I2C_PORT, &config);
 
     if (err != ESP_OK)
     {
-        printf(
+        serialPrintf(
             "i2c_param_config failed: %s\n",
             esp_err_to_name(err)
         );
     }
 
-    err =
-        i2c_driver_install(
-            I2C_PORT,
-            config.mode,
-            0,
-            0,
-            0
-        );
+    err = i2c_driver_install(
+        I2C_PORT,
+        config.mode,
+        0,
+        0,
+        0
+    );
 
     if (err != ESP_OK)
     {
-        printf(
+        serialPrintf(
             "i2c_driver_install failed: %s\n",
             esp_err_to_name(err)
         );
@@ -387,10 +407,7 @@ static void oled_clear()
     }
 }
 
-static void oled_set_cursor(
-    int x,
-    int page
-)
+static void oled_set_cursor(int x, int page)
 {
     oled_command(0xB0 + page);
     oled_command(0x00 + (x & 0x0F));
@@ -398,7 +415,7 @@ static void oled_set_cursor(
 }
 
 // ====================================================
-// OLED CHARACTER FONT
+// OLED FONT
 // ====================================================
 
 static void get_glyph(char c, uint8_t p[6])
@@ -449,17 +466,13 @@ static void get_glyph(char c, uint8_t p[6])
         case '%': p[0]=0x63; p[1]=0x13; p[2]=0x08; p[3]=0x64; p[4]=0x63; break;
         case '.': p[0]=0x00; p[1]=0x60; p[2]=0x60; p[3]=0x00; p[4]=0x00; break;
         case '-': p[0]=0x08; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x08; break;
-        case ' ': break;
 
-        default: break;
+        default:
+            break;
     }
 }
 
-static void oled_char(
-    int x,
-    int page,
-    char c
-)
+static void oled_char(int x, int page, char c)
 {
     uint8_t p[6];
 
@@ -469,11 +482,7 @@ static void oled_char(
     oled_data(p, 6);
 }
 
-static void oled_text(
-    int x,
-    int page,
-    const char *text
-)
+static void oled_text(int x, int page, const char *text)
 {
     while (*text)
     {
@@ -483,11 +492,7 @@ static void oled_text(
     }
 }
 
-static void oled_char_big(
-    int x,
-    int page,
-    char c
-)
+static void oled_char_big(int x, int page, char c)
 {
     uint8_t g[6];
     uint8_t top[12];
@@ -511,7 +516,6 @@ static void oled_char_big(
 
         top[2 * i] = low;
         top[2 * i + 1] = low;
-
         bottom[2 * i] = high;
         bottom[2 * i + 1] = high;
     }
@@ -523,11 +527,7 @@ static void oled_char_big(
     oled_data(bottom, 12);
 }
 
-static void oled_text_big(
-    int x,
-    int page,
-    const char *text
-)
+static void oled_text_big(int x, int page, const char *text)
 {
     while (*text)
     {
@@ -755,7 +755,7 @@ static bool dht22_read(
                     }
                     else
                     {
-                        printf(
+                        serialPrintf(
                             "DHT22 invalid values: "
                             "T=%.2f C H=%.2f %%\n",
                             newTemperature,
@@ -765,7 +765,7 @@ static bool dht22_read(
                 }
                 else
                 {
-                    printf(
+                    serialPrintf(
                         "DHT22 checksum failed "
                         "(calc=%u received=%u)\n",
                         checksum,
@@ -775,7 +775,7 @@ static bool dht22_read(
             }
             else
             {
-                printf(
+                serialPrintf(
                     "DHT22 timing/read failed\n"
                 );
             }
@@ -787,7 +787,7 @@ static bool dht22_read(
         !(responseLow && responseHigh)
     )
     {
-        printf(
+        serialPrintf(
             "DHT22 sensor response timeout\n"
         );
     }
@@ -837,7 +837,7 @@ void sensorTask(void *parameter)
 
     if (result != ESP_OK)
     {
-        printf(
+        serialPrintf(
             "LDR ADC initialization failed: %s\n",
             esp_err_to_name(result)
         );
@@ -863,7 +863,7 @@ void sensorTask(void *parameter)
 
     if (result != ESP_OK)
     {
-        printf(
+        serialPrintf(
             "LDR ADC channel configuration failed: %s\n",
             esp_err_to_name(result)
         );
@@ -877,17 +877,21 @@ void sensorTask(void *parameter)
     sensorData.lightLevel = 0;
     sensorData.motionDetected = false;
 
-    bool haveValidDhtReading = false;
+    bool haveValidDhtReading =
+        false;
 
-    printf(
+    serialPrintf(
         "SensorTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
 
     while (1)
     {
-        float newTemperature = 0.0f;
-        float newHumidity = 0.0f;
+        float newTemperature =
+            0.0f;
+
+        float newHumidity =
+            0.0f;
 
         if (
             dht22_read(
@@ -909,14 +913,14 @@ void sensorTask(void *parameter)
         {
             if (haveValidDhtReading)
             {
-                printf(
+                serialPrintf(
                     "DHT22 reading failed - "
                     "keeping previous valid reading\n"
                 );
             }
             else
             {
-                printf(
+                serialPrintf(
                     "DHT22 reading failed - "
                     "no valid reading yet\n"
                 );
@@ -954,22 +958,22 @@ void sensorTask(void *parameter)
         sensorData.motionDetected =
             motionDetected;
 
-        printf(
+        serialPrintf(
             "Temperature: %.2f C\n",
             sensorData.temperature
         );
 
-        printf(
+        serialPrintf(
             "Humidity: %.2f %%\n",
             sensorData.humidity
         );
 
-        printf(
+        serialPrintf(
             "Light Level: %d %%\n",
             sensorData.lightLevel
         );
 
-        printf(
+        serialPrintf(
             "Motion: %s\n",
             sensorData.motionDetected
                 ? "DETECTED"
@@ -988,7 +992,7 @@ void sensorTask(void *parameter)
                 &sensorData
             );
 
-            printf(
+            serialPrintf(
                 "Sensor data sent to queues\n"
             );
         }
@@ -1016,9 +1020,10 @@ void motionTask(void *parameter)
     int64_t lastMotionTime =
         esp_timer_get_time();
 
-    bool lastPirLevel = false;
+    bool lastPirLevel =
+        false;
 
-    printf(
+    serialPrintf(
         "MotionTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1031,34 +1036,49 @@ void motionTask(void *parameter)
         int64_t now =
             esp_timer_get_time();
 
+        // --------------------------------------------
+        // PIR ACTIVITY
+        // --------------------------------------------
+
         if (pirLevel)
         {
-            lastMotionTime = now;
+            lastMotionTime =
+                now;
 
-            motionDetected = true;
-
-            // Part X: set ACTIVE + MOTION events
-            xEventGroupSetBits(
-                systemEvents,
-                EVENT_ACTIVE | EVENT_MOTION
-            );
+            motionDetected =
+                true;
 
             if (!lastPirLevel)
             {
-                printf(
+                serialPrintf(
                     "MotionTask: MOTION DETECTED\n"
+                );
+
+                xEventGroupSetBits(
+                    systemEvents,
+                    EVENT_MOTION
+                );
+
+                serialPrintf(
+                    "EVENT_MOTION SET\n"
+                );
+
+                xEventGroupSetBits(
+                    systemEvents,
+                    EVENT_ACTIVE
+                );
+
+                serialPrintf(
+                    "EVENT_ACTIVE SET\n"
                 );
             }
 
-            if (
-                systemState ==
-                SystemState::INACTIVE
-            )
+            if (systemState == SystemState::INACTIVE)
             {
                 systemState =
                     SystemState::ACTIVE;
 
-                printf(
+                serialPrintf(
                     "System entering ACTIVE mode\n"
                 );
             }
@@ -1067,30 +1087,55 @@ void motionTask(void *parameter)
         lastPirLevel =
             pirLevel;
 
+        // --------------------------------------------
+        // INACTIVITY TIMEOUT
+        // --------------------------------------------
+
         if (
             systemState == SystemState::ACTIVE &&
-            (now - lastMotionTime)
-                >= INACTIVITY_TIMEOUT_US
+            (now - lastMotionTime) >= INACTIVITY_TIMEOUT_US
         )
         {
-            motionDetected = false;
+            motionDetected =
+                false;
 
             systemState =
                 SystemState::INACTIVE;
 
-            // Part X: clear ACTIVE + MOTION events
-            xEventGroupClearBits(
-                systemEvents,
-                EVENT_ACTIVE | EVENT_MOTION
-            );
-
-            printf(
+            serialPrintf(
                 "MotionTask: NO MOTION - "
                 "15 SECOND TIMEOUT\n"
             );
 
-            printf(
+            serialPrintf(
                 "System entering INACTIVE mode\n"
+            );
+
+            xEventGroupClearBits(
+                systemEvents,
+                EVENT_ACTIVE
+            );
+
+            serialPrintf(
+                "EVENT_ACTIVE CLEARED\n"
+            );
+
+            xEventGroupClearBits(
+                systemEvents,
+                EVENT_MOTION
+            );
+
+            serialPrintf(
+                "EVENT_MOTION CLEARED\n"
+            );
+
+            xEventGroupClearBits(
+                systemEvents,
+                EVENT_ALARM
+            );
+
+            serialPrintf(
+                "EVENT_ALARM CLEARED - system inactive\n"
             );
         }
 
@@ -1150,9 +1195,17 @@ void inputTask(void *parameter)
         GPIO_MODE_INPUT
     );
 
-    gpio_pullup_en(ENCODER_CLK);
-    gpio_pullup_en(ENCODER_DT);
-    gpio_pullup_en(ENCODER_SW);
+    gpio_pullup_en(
+        ENCODER_CLK
+    );
+
+    gpio_pullup_en(
+        ENCODER_DT
+    );
+
+    gpio_pullup_en(
+        ENCODER_SW
+    );
 
     gpio_set_intr_type(
         ENCODER_CLK,
@@ -1167,7 +1220,7 @@ void inputTask(void *parameter)
         err != ESP_ERR_INVALID_STATE
     )
     {
-        printf(
+        serialPrintf(
             "gpio_install_isr_service failed: %s\n",
             esp_err_to_name(err)
         );
@@ -1183,15 +1236,21 @@ void inputTask(void *parameter)
         DisplayMode::TEMPERATURE;
 
     bool lastButton =
-        gpio_get_level(ENCODER_SW);
+        gpio_get_level(
+            ENCODER_SW
+        );
 
-    printf(
+    serialPrintf(
         "InputTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
 
     while (1)
     {
+        // --------------------------------------------
+        // ROTATION
+        // --------------------------------------------
+
         int8_t direction = 0;
 
         if (
@@ -1202,21 +1261,18 @@ void inputTask(void *parameter)
             ) == pdPASS
         )
         {
-            // Part X: read ACTIVE event
+            // Encoder is active only when EVENT_ACTIVE is set.
             EventBits_t events =
                 xEventGroupGetBits(systemEvents);
 
-            bool active =
-                (events & EVENT_ACTIVE) != 0;
-
-            if (active)
+            if (events & EVENT_ACTIVE)
             {
                 if (direction > 0)
                 {
                     currentMode =
                         nextMode(currentMode);
 
-                    printf(
+                    serialPrintf(
                         "InputTask: clockwise -> %s\n",
                         modeToString(currentMode)
                     );
@@ -1226,7 +1282,7 @@ void inputTask(void *parameter)
                     currentMode =
                         previousMode(currentMode);
 
-                    printf(
+                    serialPrintf(
                         "InputTask: counter-clockwise -> %s\n",
                         modeToString(currentMode)
                     );
@@ -1239,20 +1295,19 @@ void inputTask(void *parameter)
             }
         }
 
+        // --------------------------------------------
+        // ENCODER BUTTON
+        // --------------------------------------------
+
         bool currentButton =
-            gpio_get_level(ENCODER_SW);
-
-        // Read ACTIVE event before accepting button input
-        EventBits_t events =
-            xEventGroupGetBits(systemEvents);
-
-        bool active =
-            (events & EVENT_ACTIVE) != 0;
+            gpio_get_level(
+                ENCODER_SW
+            );
 
         if (
             lastButton == 1 &&
             currentButton == 0 &&
-            active
+            (xEventGroupGetBits(systemEvents) & EVENT_ACTIVE)
         )
         {
             currentMode =
@@ -1263,7 +1318,7 @@ void inputTask(void *parameter)
                 &currentMode
             );
 
-            printf(
+            serialPrintf(
                 "InputTask: button pressed -> %s\n",
                 modeToString(currentMode)
             );
@@ -1320,7 +1375,7 @@ static void drawPage(
                 line
             );
 
-            printf(
+            serialPrintf(
                 "DisplayTask: "
                 "Temperature page = %.2f C\n",
                 data.temperature
@@ -1349,7 +1404,7 @@ static void drawPage(
                 line
             );
 
-            printf(
+            serialPrintf(
                 "DisplayTask: "
                 "Humidity page = %.2f %%\n",
                 data.humidity
@@ -1378,7 +1433,7 @@ static void drawPage(
                 line
             );
 
-            printf(
+            serialPrintf(
                 "DisplayTask: "
                 "Light page = %d %%\n",
                 data.lightLevel
@@ -1402,7 +1457,7 @@ static void drawPage(
                     : "NONE"
             );
 
-            printf(
+            serialPrintf(
                 "DisplayTask: Motion page = %s\n",
                 motionDetected
                     ? "DETECTED"
@@ -1428,12 +1483,11 @@ void displayTask(void *parameter)
     bool displayOn = true;
     bool needRedraw = true;
     bool lastMotionShown = false;
-    bool lastAlarmShown = false;
 
     oled_init();
     oled_clear();
 
-    printf(
+    serialPrintf(
         "DisplayTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1467,7 +1521,7 @@ void displayTask(void *parameter)
         }
 
         // --------------------------------------------
-        // PART X - READ EVENT GROUP
+        // EVENT GROUP STATE
         // --------------------------------------------
 
         EventBits_t events =
@@ -1476,11 +1530,20 @@ void displayTask(void *parameter)
         bool active =
             (events & EVENT_ACTIVE) != 0;
 
-        bool motion =
-            (events & EVENT_MOTION) != 0;
+        static EventBits_t previousEvents = 0;
 
-        bool alarm =
-            (events & EVENT_ALARM) != 0;
+        if (events != previousEvents)
+        {
+            serialPrintf(
+                "DisplayTask Events: "
+                "ACTIVE=%d MOTION=%d ALARM=%d\n",
+                (events & EVENT_ACTIVE) ? 1 : 0,
+                (events & EVENT_MOTION) ? 1 : 0,
+                (events & EVENT_ALARM) ? 1 : 0
+            );
+
+            previousEvents = events;
+        }
 
         // --------------------------------------------
         // INACTIVE
@@ -1495,7 +1558,7 @@ void displayTask(void *parameter)
 
                 displayOn = false;
 
-                printf(
+                serialPrintf(
                     "DisplayTask: OLED OFF - "
                     "system INACTIVE\n"
                 );
@@ -1515,7 +1578,7 @@ void displayTask(void *parameter)
             displayOn = true;
             needRedraw = true;
 
-            printf(
+            serialPrintf(
                 "DisplayTask: OLED ON - "
                 "system ACTIVE\n"
             );
@@ -1523,28 +1586,19 @@ void displayTask(void *parameter)
 
         if (
             currentMode == DisplayMode::MOTION &&
-            motion != lastMotionShown
+            motionDetected != lastMotionShown
         )
         {
             needRedraw = true;
-        }
-
-        // Alarm event is consumed here.
-        if (alarm != lastAlarmShown)
-        {
-            lastAlarmShown = alarm;
-
-            printf(
-                "DisplayTask: Alarm event = %s\n",
-                alarm ? "ACTIVE" : "CLEAR"
-            );
         }
 
         if (!haveData || !needRedraw)
             continue;
 
         needRedraw = false;
-        lastMotionShown = motion;
+
+        lastMotionShown =
+            motionDetected;
 
         drawPage(
             currentMode,
@@ -1566,7 +1620,7 @@ void alarmTask(void *parameter)
 
     bool firstEvaluation = true;
 
-    printf(
+    serialPrintf(
         "AlarmTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1581,17 +1635,11 @@ void alarmTask(void *parameter)
             ) == pdPASS
         )
         {
-            // ----------------------------------------
-            // READ ACTIVE EVENT
-            // ----------------------------------------
-
-            EventBits_t events =
-                xEventGroupGetBits(systemEvents);
-
-            bool active =
-                (events & EVENT_ACTIVE) != 0;
-
-            if (!active)
+            // Alarm is active only when EVENT_ACTIVE is set.
+            if (
+                (xEventGroupGetBits(systemEvents)
+                 & EVENT_ACTIVE) == 0
+            )
             {
                 xEventGroupClearBits(
                     systemEvents,
@@ -1603,52 +1651,73 @@ void alarmTask(void *parameter)
                 continue;
             }
 
-            // ----------------------------------------
-            // TEMPERATURE DECISION
-            // ----------------------------------------
-
             AlarmState state =
                 evaluateTemperature(
                     sensorData.temperature
                 );
 
-            // ----------------------------------------
-            // SET/CLEAR ALARM EVENT
-            // ----------------------------------------
+            // --------------------------------------------
+            // UPDATE EVENT_ALARM
+            // --------------------------------------------
 
-            if (state != AlarmState::NORMAL)
+            EventBits_t currentEvents =
+                xEventGroupGetBits(systemEvents);
+
+            bool alarmActive =
+                state == AlarmState::LOW_TEMPERATURE ||
+                state == AlarmState::HIGH_TEMPERATURE;
+
+            if (alarmActive)
             {
-                xEventGroupSetBits(
-                    systemEvents,
-                    EVENT_ALARM
-                );
+                if (
+                    (currentEvents & EVENT_ALARM) == 0
+                )
+                {
+                    xEventGroupSetBits(
+                        systemEvents,
+                        EVENT_ALARM
+                    );
+
+                    serialPrintf(
+                        "EVENT_ALARM SET\n"
+                    );
+                }
             }
             else
             {
-                xEventGroupClearBits(
-                    systemEvents,
-                    EVENT_ALARM
-                );
+                if (currentEvents & EVENT_ALARM)
+                {
+                    xEventGroupClearBits(
+                        systemEvents,
+                        EVENT_ALARM
+                    );
+
+                    serialPrintf(
+                        "EVENT_ALARM CLEARED\n"
+                    );
+                }
             }
 
-            // ----------------------------------------
-            // LOG STATE CHANGE
-            // ----------------------------------------
+            // --------------------------------------------
+            // PRINT ALARM STATE WHEN IT CHANGES
+            // --------------------------------------------
 
             if (
                 firstEvaluation ||
                 state != lastState
             )
             {
-                printf(
+                serialPrintf(
                     "Alarm State: %s (%.1f C)\n",
                     alarmStateToString(state),
                     sensorData.temperature
                 );
 
-                // Buzzer hardware control would go here.
+                // Hardware hook:
+                // drive the buzzer here based on state.
 
                 lastState = state;
+
                 firstEvaluation = false;
             }
         }
@@ -1661,21 +1730,21 @@ void alarmTask(void *parameter)
 
 extern "C" void app_main(void)
 {
-    printf("\n");
+    serialPrintf("\n");
 
-    printf(
+    serialPrintf(
         "====================================\n"
     );
 
-    printf(
+    serialPrintf(
         "BCA152 FreeRTOS Multisensor\n"
     );
 
-    printf(
+    serialPrintf(
         "System starting...\n"
     );
 
-    printf(
+    serialPrintf(
         "====================================\n"
     );
 
@@ -1688,7 +1757,9 @@ extern "C" void app_main(void)
         GPIO_MODE_INPUT
     );
 
-    gpio_pullup_en(DHT_PIN);
+    gpio_pullup_en(
+        DHT_PIN
+    );
 
     // --------------------------------------------
     // PIR
@@ -1699,7 +1770,9 @@ extern "C" void app_main(void)
         GPIO_MODE_INPUT
     );
 
-    gpio_pulldown_en(PIR_PIN);
+    gpio_pulldown_en(
+        PIR_PIN
+    );
 
     // --------------------------------------------
     // CREATE QUEUES
@@ -1736,19 +1809,19 @@ extern "C" void app_main(void)
         encoderQueue == NULL
     )
     {
-        printf(
+        serialPrintf(
             "ERROR: Failed to create queues\n"
         );
 
         return;
     }
 
-    printf(
+    serialPrintf(
         "Queues created successfully.\n"
     );
 
     // --------------------------------------------
-    // CREATE EVENT GROUP
+    // CREATE EVENT GROUP - Part X
     // --------------------------------------------
 
     systemEvents =
@@ -1756,32 +1829,84 @@ extern "C" void app_main(void)
 
     if (systemEvents == NULL)
     {
-        printf(
-            "ERROR: Failed to create event group\n"
+        serialPrintf(
+            "ERROR: Failed to create Event Group\n"
         );
 
         return;
     }
 
-    printf(
-        "Event group created successfully.\n"
+    serialPrintf(
+        "Event Group created successfully.\n"
     );
 
-    // Initial system state is ACTIVE.
+    serialPrintf(
+        "EVENT_ACTIVE = BIT0\n"
+    );
+
+    serialPrintf(
+        "EVENT_MOTION = BIT1\n"
+    );
+
+    serialPrintf(
+        "EVENT_ALARM = BIT2\n"
+    );
+
+    // --------------------------------------------
+    // CREATE SERIAL MUTEX - Part XI
+    // --------------------------------------------
+
+    serialMutex =
+        xSemaphoreCreateMutex();
+
+    if (serialMutex == NULL)
+    {
+        serialPrintf(
+            "ERROR: Failed to create serial mutex\n"
+        );
+
+        return;
+    }
+
+    serialPrintf(
+        "Serial mutex created successfully.\n"
+    );
+
+    // --------------------------------------------
+    // SYSTEM STARTS ACTIVE
+    // --------------------------------------------
+
     xEventGroupSetBits(
         systemEvents,
         EVENT_ACTIVE
     );
 
-    printf(
-        "Initial event: EVENT_ACTIVE\n"
+    serialPrintf(
+        "EVENT_ACTIVE SET - system startup\n"
     );
 
     // --------------------------------------------
-    // SENSOR TASK - CPU0
+    // CPU ASSIGNMENT
+    // --------------------------------------------
+    //
+    // CPU0:
+    // SensorTask
+    // MotionTask
+    //
+    // CPU1:
+    // InputTask
+    // DisplayTask
+    // AlarmTask
+    //
     // --------------------------------------------
 
-    BaseType_t result =
+    BaseType_t result;
+
+    // --------------------------------------------
+    // SENSOR TASK
+    // --------------------------------------------
+
+    result =
         xTaskCreatePinnedToCore(
             sensorTask,
             "SensorTask",
@@ -1794,7 +1919,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        serialPrintf(
             "ERROR: SensorTask creation failed\n"
         );
 
@@ -1802,7 +1927,7 @@ extern "C" void app_main(void)
     }
 
     // --------------------------------------------
-    // MOTION TASK - CPU0
+    // MOTION TASK
     // --------------------------------------------
 
     result =
@@ -1818,7 +1943,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        serialPrintf(
             "ERROR: MotionTask creation failed\n"
         );
 
@@ -1826,7 +1951,7 @@ extern "C" void app_main(void)
     }
 
     // --------------------------------------------
-    // INPUT TASK - CPU1
+    // INPUT TASK
     // --------------------------------------------
 
     result =
@@ -1842,7 +1967,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        serialPrintf(
             "ERROR: InputTask creation failed\n"
         );
 
@@ -1850,7 +1975,7 @@ extern "C" void app_main(void)
     }
 
     // --------------------------------------------
-    // DISPLAY TASK - CPU1
+    // DISPLAY TASK
     // --------------------------------------------
 
     result =
@@ -1866,7 +1991,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        serialPrintf(
             "ERROR: DisplayTask creation failed\n"
         );
 
@@ -1874,7 +1999,7 @@ extern "C" void app_main(void)
     }
 
     // --------------------------------------------
-    // ALARM TASK - CPU1
+    // ALARM TASK
     // --------------------------------------------
 
     result =
@@ -1890,30 +2015,14 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        serialPrintf(
             "ERROR: AlarmTask creation failed\n"
         );
 
         return;
     }
 
-    printf(
+    serialPrintf(
         "All tasks started successfully.\n"
-    );
-
-    printf(
-        "Part X Event Group initialized.\n"
-    );
-
-    printf(
-        "EVENT_ACTIVE = BIT0\n"
-    );
-
-    printf(
-        "EVENT_MOTION = BIT1\n"
-    );
-
-    printf(
-        "EVENT_ALARM  = BIT2\n"
     );
 }
