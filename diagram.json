@@ -19,7 +19,8 @@
       "left": 0.23,
       "attrs": { "i2cAddress": "0x3c" }
     },
-    { "type": "wokwi-ky-040", "id": "encoder1", "top": 270.5, "left": -202.4, "attrs": {} }
+    { "type": "wokwi-ky-040", "id": "encoder1", "top": 270.5, "left": -202.4, "attrs": {} },
+    { "type": "wokwi-buzzer", "id": "bz1", "top": 141.6, "left": 231, "attrs": { "volume": "0.1" } }
   ],
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
@@ -38,7 +39,9 @@
     [ "encoder1:DT", "esp:33", "green", [ "h19.2", "v-191.9" ] ],
     [ "encoder1:SW", "esp:25", "green", [ "h28.8", "v-191.9" ] ],
     [ "encoder1:VCC", "esp:3V3", "red", [ "h38.4", "v-287.6", "h0" ] ],
-    [ "encoder1:GND", "esp:GND.1", "black", [ "h0", "v-162.4" ] ]
+    [ "encoder1:GND", "esp:GND.1", "black", [ "h0", "v-162.4" ] ],
+    [ "bz1:2", "esp:26", "green", [] ],
+    [ "bz1:1", "esp:GND.1", "black", [] ]
   ],
   "dependencies": {}
 }
