@@ -1,79 +1,102 @@
-/* =====================================================================*
- *  BCA152 - FreeRTOS Room Multisensor
- *
- *  Sections:
- *  1 Settings
- *  2 Shared types
- *  3 DHT22
- *  4 LDR
- *  5 SensorTask
- *  6 OLED driver
- *  7 DisplayTask
- *  8 InputTask
- *  9 app_main
- * ===================================================================== */
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "esp_attr.h"
+#include "esp_err.h"
 
 #include "alarm.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/task.h"
+// ====================================================
+// PIN DEFINITIONS
+// ====================================================
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_attr.h"
-#include "esp_log.h"
-#include "esp_rom_sys.h"
-#include "esp_timer.h"
+#define DHT_PIN GPIO_NUM_4
 
+#define LDR_ADC_CHANNEL ADC_CHANNEL_6   // GPIO34
 
-/* ============================ 1. SETTINGS ============================ */
+#define OLED_SDA GPIO_NUM_21
+#define OLED_SCL GPIO_NUM_22
+#define OLED_ADDR 0x3C
+#define I2C_PORT I2C_NUM_0
 
-// Pins: must match diagram.json
-static const gpio_num_t DHT22_PIN      = GPIO_NUM_4;
-static const adc_channel_t LDR_CHANNEL = ADC_CHANNEL_6; // GPIO34
-static const gpio_num_t OLED_SDA_PIN   = GPIO_NUM_21;
-static const gpio_num_t OLED_SCL_PIN   = GPIO_NUM_22;
-static const gpio_num_t ENC_CLK_PIN    = GPIO_NUM_32;
-static const gpio_num_t ENC_DT_PIN     = GPIO_NUM_33;
+// Rotary Encoder
+#define ENCODER_CLK GPIO_NUM_32
+#define ENCODER_DT  GPIO_NUM_33
+#define ENCODER_SW  GPIO_NUM_25
 
-#define OLED_I2C_ADDR     0x3C
-#define SENSOR_PERIOD_MS  2000
+// PIR motion sensor
+#define PIR_PIN GPIO_NUM_27
 
-// Task priorities
-#define PRIO_INPUT    3
-#define PRIO_SENSOR   2
-#define PRIO_DISPLAY  1
+// ====================================================
+// DHT22 SETTINGS
+// ====================================================
 
+#define DHT_TIMEOUT_US 150
+#define DHT_BIT_TIMEOUT_US 120
+#define DHT_ONE_THRESHOLD_US 50
 
-/* ========================= 2. SHARED TYPES =========================== */
+// ====================================================
+// TIMING SETTINGS
+// ====================================================
 
-struct SensorData {
-    float temperature;
-    float humidity;
-    int   lightLevel;
-    bool  motionDetected;
-};
+// Laboratory testing value for inactivity timeout
+#define INACTIVITY_TIMEOUT_US 15000000LL
 
-enum class DisplayMode {
+// ====================================================
+// ENCODER SETTINGS
+// ====================================================
+
+constexpr bool ENCODER_REVERSE = false;
+
+// ====================================================
+// ENUMERATIONS
+// ====================================================
+
+enum class DisplayMode
+{
     TEMPERATURE,
     HUMIDITY,
     LIGHT,
     MOTION
 };
 
-
-/* ======================= DISPLAY NAVIGATION ========================== */
-
-static DisplayMode nextDisplayMode(DisplayMode current)
+// System state machine
+enum class SystemState
 {
-    switch (current) {
+    ACTIVE,
+    INACTIVE
+};
+
+// ====================================================
+// SENSOR DATA
+// ====================================================
+
+struct SensorData
+{
+    float temperature;
+    float humidity;
+    int lightLevel;
+    bool motionDetected;
+};
+
+// ====================================================
+// DISPLAY MODE HELPERS
+// ====================================================
+
+static DisplayMode nextMode(DisplayMode mode)
+{
+    switch (mode)
+    {
         case DisplayMode::TEMPERATURE:
             return DisplayMode::HUMIDITY;
 
@@ -90,10 +113,10 @@ static DisplayMode nextDisplayMode(DisplayMode current)
     return DisplayMode::TEMPERATURE;
 }
 
-
-static DisplayMode previousDisplayMode(DisplayMode current)
+static DisplayMode previousMode(DisplayMode mode)
 {
-    switch (current) {
+    switch (mode)
+    {
         case DisplayMode::TEMPERATURE:
             return DisplayMode::MOTION;
 
@@ -110,1144 +133,1146 @@ static DisplayMode previousDisplayMode(DisplayMode current)
     return DisplayMode::TEMPERATURE;
 }
 
+static const char *modeToString(DisplayMode mode)
+{
+    switch (mode)
+    {
+        case DisplayMode::TEMPERATURE:
+            return "TEMPERATURE";
 
-/* =========================== QUEUES ================================= */
+        case DisplayMode::HUMIDITY:
+            return "HUMIDITY";
 
-static QueueHandle_t g_sensorQueue      = nullptr;
-static QueueHandle_t g_displayModeQueue = nullptr;
-static QueueHandle_t g_encoderQueue     = nullptr;
+        case DisplayMode::LIGHT:
+            return "LIGHT";
 
+        case DisplayMode::MOTION:
+            return "MOTION";
+    }
 
-/* ============================ 3. DHT22 =============================== */
+    return "UNKNOWN";
+}
 
-static const char *TAG_DHT = "dht22";
+// ====================================================
+// ALARM STRING HELPER
+// ====================================================
 
-static portMUX_TYPE s_dhtLock =
-    portMUX_INITIALIZER_UNLOCKED;
+static const char *alarmStateToString(AlarmState state)
+{
+    switch (state)
+    {
+        case AlarmState::NORMAL:
+            return "NORMAL";
 
+        case AlarmState::LOW_TEMPERATURE:
+            return "LOW_TEMPERATURE";
 
-static bool awaitLevel(
-    int level,
-    uint32_t timeoutUs,
-    uint32_t *waitedUs
+        case AlarmState::HIGH_TEMPERATURE:
+            return "HIGH_TEMPERATURE";
+    }
+
+    return "UNKNOWN";
+}
+
+// ====================================================
+// QUEUES
+// ====================================================
+
+QueueHandle_t displayQueue;
+QueueHandle_t alarmQueue;
+QueueHandle_t modeQueue;
+QueueHandle_t encoderQueue;
+
+// +1 = clockwise
+// -1 = counter-clockwise
+
+// ====================================================
+// SYSTEM STATE
+// ====================================================
+
+volatile SystemState systemState = SystemState::ACTIVE;
+volatile bool motionDetected = false;
+
+// ====================================================
+// HELPERS
+// ====================================================
+
+// pdMS_TO_TICKS() can round very small values down to 0.
+// This helper guarantees that a task blocks for at least one tick.
+static inline TickType_t ms_to_ticks(uint32_t ms)
+{
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+
+    return (ticks == 0) ? 1 : ticks;
+}
+
+// ====================================================
+// OLED
+// ====================================================
+
+static bool i2cErrorLogged = false;
+
+static void report_i2c_error(esp_err_t err)
+{
+    if (err != ESP_OK && !i2cErrorLogged)
+    {
+        i2cErrorLogged = true;
+
+        printf(
+            "OLED I2C error: %s "
+            "(check SDA=21, SCL=22, address 0x3C)\n",
+            esp_err_to_name(err)
+        );
+    }
+}
+
+static void oled_command(uint8_t command)
+{
+    uint8_t data[2] =
+    {
+        0x00,
+        command
+    };
+
+    esp_err_t err =
+        i2c_master_write_to_device(
+            I2C_PORT,
+            OLED_ADDR,
+            data,
+            sizeof(data),
+            pdMS_TO_TICKS(100)
+        );
+
+    report_i2c_error(err);
+}
+
+static void oled_data(
+    const uint8_t *data,
+    size_t length
 )
 {
-    int64_t start = esp_timer_get_time();
+    uint8_t buffer[129];
 
-    while (gpio_get_level(DHT22_PIN) != level) {
-        if (
-            esp_timer_get_time() - start >
-            (int64_t)timeoutUs
-        ) {
-            return false;
-        }
-    }
+    if (length > 128)
+        return;
 
-    if (waitedUs != nullptr) {
-        *waitedUs =
-            (uint32_t)(
-                esp_timer_get_time() - start
-            );
-    }
+    buffer[0] = 0x40;
 
-    return true;
+    for (size_t i = 0; i < length; i++)
+        buffer[i + 1] = data[i];
+
+    esp_err_t err =
+        i2c_master_write_to_device(
+            I2C_PORT,
+            OLED_ADDR,
+            buffer,
+            length + 1,
+            pdMS_TO_TICKS(100)
+        );
+
+    report_i2c_error(err);
 }
 
-
-static void dht22Init(void)
+static void oled_init()
 {
-    gpio_config_t cfg = {};
+    i2c_config_t config = {};
 
-    cfg.pin_bit_mask =
-        1ULL << DHT22_PIN;
+    config.mode = I2C_MODE_MASTER;
+    config.sda_io_num = OLED_SDA;
+    config.scl_io_num = OLED_SCL;
+    config.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    config.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    config.master.clk_speed = 400000;
 
-    cfg.mode =
-        GPIO_MODE_INPUT_OUTPUT_OD;
+    esp_err_t err =
+        i2c_param_config(
+            I2C_PORT,
+            &config
+        );
 
-    cfg.pull_up_en =
-        GPIO_PULLUP_ENABLE;
+    if (err != ESP_OK)
+    {
+        printf(
+            "i2c_param_config failed: %s\n",
+            esp_err_to_name(err)
+        );
+    }
 
-    cfg.pull_down_en =
-        GPIO_PULLDOWN_DISABLE;
+    err =
+        i2c_driver_install(
+            I2C_PORT,
+            config.mode,
+            0,
+            0,
+            0
+        );
 
-    cfg.intr_type =
-        GPIO_INTR_DISABLE;
+    if (err != ESP_OK)
+    {
+        printf(
+            "i2c_driver_install failed: %s\n",
+            esp_err_to_name(err)
+        );
+    }
 
-    ESP_ERROR_CHECK(
-        gpio_config(&cfg)
-    );
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    gpio_set_level(
-        DHT22_PIN,
-        1
-    );
+    oled_command(0xAE);
+    oled_command(0xD5);
+    oled_command(0x80);
+    oled_command(0xA8);
+    oled_command(0x3F);
+    oled_command(0xD3);
+    oled_command(0x00);
+    oled_command(0x40);
+    oled_command(0x8D);
+    oled_command(0x14);
+    oled_command(0x20);
+    oled_command(0x00);
+    oled_command(0xA1);
+    oled_command(0xC8);
+    oled_command(0xDA);
+    oled_command(0x12);
+    oled_command(0x81);
+    oled_command(0xCF);
+    oled_command(0xD9);
+    oled_command(0xF1);
+    oled_command(0xDB);
+    oled_command(0x40);
+    oled_command(0xA4);
+    oled_command(0xA6);
+    oled_command(0xAF);
 }
 
+static void oled_power(bool on)
+{
+    oled_command(on ? 0xAF : 0xAE);
+}
 
-static bool dht22Read(
+static void oled_clear()
+{
+    uint8_t blank[128] = {0};
+
+    for (int page = 0; page < 8; page++)
+    {
+        oled_command(0xB0 + page);
+        oled_command(0x00);
+        oled_command(0x10);
+        oled_data(blank, 128);
+    }
+}
+
+static void oled_set_cursor(
+    int x,
+    int page
+)
+{
+    oled_command(0xB0 + page);
+    oled_command(0x00 + (x & 0x0F));
+    oled_command(0x10 + ((x >> 4) & 0x0F));
+}
+
+// ====================================================
+// OLED CHARACTER FONT
+// ====================================================
+
+static void get_glyph(
+    char c,
+    uint8_t p[6]
+)
+{
+    for (int i = 0; i < 6; i++)
+        p[i] = 0;
+
+    switch (c)
+    {
+        case 'A':
+            p[0]=0x7E; p[1]=0x11; p[2]=0x11; p[3]=0x11; p[4]=0x7E;
+            break;
+
+        case 'B':
+            p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36;
+            break;
+
+        case 'C':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x22;
+            break;
+
+        case 'D':
+            p[0]=0x7F; p[1]=0x41; p[2]=0x41; p[3]=0x22; p[4]=0x1C;
+            break;
+
+        case 'E':
+            p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x41;
+            break;
+
+        case 'F':
+            p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x01;
+            break;
+
+        case 'G':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x49; p[3]=0x49; p[4]=0x7A;
+            break;
+
+        case 'H':
+            p[0]=0x7F; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x7F;
+            break;
+
+        case 'I':
+            p[0]=0x00; p[1]=0x41; p[2]=0x7F; p[3]=0x41; p[4]=0x00;
+            break;
+
+        case 'J':
+            p[0]=0x20; p[1]=0x40; p[2]=0x41; p[3]=0x3F; p[4]=0x01;
+            break;
+
+        case 'K':
+            p[0]=0x7F; p[1]=0x08; p[2]=0x14; p[3]=0x22; p[4]=0x41;
+            break;
+
+        case 'L':
+            p[0]=0x7F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x40;
+            break;
+
+        case 'M':
+            p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x02; p[4]=0x7F;
+            break;
+
+        case 'N':
+            p[0]=0x7F; p[1]=0x02; p[2]=0x0C; p[3]=0x18; p[4]=0x7F;
+            break;
+
+        case 'O':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x3E;
+            break;
+
+        case 'P':
+            p[0]=0x7F; p[1]=0x09; p[2]=0x09; p[3]=0x09; p[4]=0x06;
+            break;
+
+        case 'Q':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x51; p[3]=0x21; p[4]=0x5E;
+            break;
+
+        case 'R':
+            p[0]=0x7F; p[1]=0x09; p[2]=0x19; p[3]=0x29; p[4]=0x46;
+            break;
+
+        case 'S':
+            p[0]=0x46; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x31;
+            break;
+
+        case 'T':
+            p[0]=0x01; p[1]=0x01; p[2]=0x7F; p[3]=0x01; p[4]=0x01;
+            break;
+
+        case 'U':
+            p[0]=0x3F; p[1]=0x40; p[2]=0x40; p[3]=0x40; p[4]=0x3F;
+            break;
+
+        case 'V':
+            p[0]=0x1F; p[1]=0x20; p[2]=0x40; p[3]=0x20; p[4]=0x1F;
+            break;
+
+        case 'W':
+            p[0]=0x7F; p[1]=0x20; p[2]=0x18; p[3]=0x20; p[4]=0x7F;
+            break;
+
+        case 'X':
+            p[0]=0x63; p[1]=0x14; p[2]=0x08; p[3]=0x14; p[4]=0x63;
+            break;
+
+        case 'Y':
+            p[0]=0x07; p[1]=0x08; p[2]=0x70; p[3]=0x08; p[4]=0x07;
+            break;
+
+        case 'Z':
+            p[0]=0x61; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x43;
+            break;
+
+        case '0':
+            p[0]=0x3E; p[1]=0x51; p[2]=0x49; p[3]=0x45; p[4]=0x3E;
+            break;
+
+        case '1':
+            p[0]=0x00; p[1]=0x42; p[2]=0x7F; p[3]=0x40; p[4]=0x00;
+            break;
+
+        case '2':
+            p[0]=0x42; p[1]=0x61; p[2]=0x51; p[3]=0x49; p[4]=0x46;
+            break;
+
+        case '3':
+            p[0]=0x21; p[1]=0x41; p[2]=0x45; p[3]=0x4B; p[4]=0x31;
+            break;
+
+        case '4':
+            p[0]=0x18; p[1]=0x14; p[2]=0x12; p[3]=0x7F; p[4]=0x10;
+            break;
+
+        case '5':
+            p[0]=0x27; p[1]=0x45; p[2]=0x45; p[3]=0x45; p[4]=0x39;
+            break;
+
+        case '6':
+            p[0]=0x3C; p[1]=0x4A; p[2]=0x49; p[3]=0x49; p[4]=0x30;
+            break;
+
+        case '7':
+            p[0]=0x01; p[1]=0x71; p[2]=0x09; p[3]=0x05; p[4]=0x03;
+            break;
+
+        case '8':
+            p[0]=0x36; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36;
+            break;
+
+        case '9':
+            p[0]=0x06; p[1]=0x49; p[2]=0x49; p[3]=0x29; p[4]=0x1E;
+            break;
+
+        case '%':
+            p[0]=0x63; p[1]=0x13; p[2]=0x08; p[3]=0x64; p[4]=0x63;
+            break;
+
+        case '.':
+            p[0]=0x00; p[1]=0x60; p[2]=0x60; p[3]=0x00; p[4]=0x00;
+            break;
+
+        case '-':
+            p[0]=0x08; p[1]=0x08; p[2]=0x08; p[3]=0x08; p[4]=0x08;
+            break;
+
+        case ' ':
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void oled_char(
+    int x,
+    int page,
+    char c
+)
+{
+    uint8_t p[6];
+
+    get_glyph(c, p);
+
+    oled_set_cursor(x, page);
+    oled_data(p, 6);
+}
+
+static void oled_text(
+    int x,
+    int page,
+    const char *text
+)
+{
+    while (*text)
+    {
+        oled_char(x, page, *text);
+        x += 6;
+        text++;
+    }
+}
+
+static void oled_char_big(
+    int x,
+    int page,
+    char c
+)
+{
+    uint8_t g[6];
+    uint8_t top[12];
+    uint8_t bottom[12];
+
+    get_glyph(c, g);
+
+    for (int i = 0; i < 6; i++)
+    {
+        uint8_t low = 0;
+        uint8_t high = 0;
+
+        for (int b = 0; b < 4; b++)
+        {
+            if (g[i] & (1 << b))
+                low |= (uint8_t)(3 << (2 * b));
+
+            if (g[i] & (1 << (b + 4)))
+                high |= (uint8_t)(3 << (2 * b));
+        }
+
+        top[2 * i] = low;
+        top[2 * i + 1] = low;
+
+        bottom[2 * i] = high;
+        bottom[2 * i + 1] = high;
+    }
+
+    oled_set_cursor(x, page);
+    oled_data(top, 12);
+
+    oled_set_cursor(x, page + 1);
+    oled_data(bottom, 12);
+}
+
+static void oled_text_big(
+    int x,
+    int page,
+    const char *text
+)
+{
+    while (*text)
+    {
+        oled_char_big(x, page, *text);
+        x += 12;
+        text++;
+    }
+}
+
+// ====================================================
+// DHT22
+// ====================================================
+
+static portMUX_TYPE dhtMux =
+    portMUX_INITIALIZER_UNLOCKED;
+
+static bool dht22_read(
     float *temperature,
     float *humidity
 )
 {
-    uint8_t data[5] = {
-        0, 0, 0, 0, 0
+    uint8_t data[5] =
+    {
+        0,
+        0,
+        0,
+        0,
+        0
     };
 
-    bool ok = true;
+    bool success = false;
 
-    portENTER_CRITICAL(
-        &s_dhtLock
+    portENTER_CRITICAL(&dhtMux);
+
+    gpio_set_direction(
+        DHT_PIN,
+        GPIO_MODE_OUTPUT
     );
 
-    // Wake the sensor
     gpio_set_level(
-        DHT22_PIN,
+        DHT_PIN,
         0
     );
 
-    esp_rom_delay_us(2000);
+    esp_rom_delay_us(1200);
 
     gpio_set_level(
-        DHT22_PIN,
+        DHT_PIN,
         1
     );
 
-    // Sensor response
-    ok =
-        awaitLevel(
-            1,
-            60,
-            nullptr
-        )
-        &&
-        awaitLevel(
-            0,
-            100,
-            nullptr
-        )
-        &&
-        awaitLevel(
-            1,
-            120,
-            nullptr
-        )
-        &&
-        awaitLevel(
-            0,
-            120,
-            nullptr
-        );
+    esp_rom_delay_us(30);
 
-    // Read 40 bits
-    for (
-        int i = 0;
-        ok && i < 40;
-        i++
-    )
+    gpio_set_direction(
+        DHT_PIN,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_pullup_en(DHT_PIN);
+
+    int64_t start =
+        esp_timer_get_time();
+
+    while (gpio_get_level(DHT_PIN) == 1)
     {
-        uint32_t lowUs = 0;
-        uint32_t highUs = 0;
+        if (
+            (esp_timer_get_time() - start)
+            > DHT_TIMEOUT_US
+        )
+        {
+            break;
+        }
+    }
 
-        ok =
-            awaitLevel(
-                1,
-                100,
-                &lowUs
+    bool responseLow =
+        (gpio_get_level(DHT_PIN) == 0);
+
+    if (responseLow)
+    {
+        start =
+            esp_timer_get_time();
+
+        while (gpio_get_level(DHT_PIN) == 0)
+        {
+            if (
+                (esp_timer_get_time() - start)
+                > DHT_TIMEOUT_US
             )
-            &&
-            awaitLevel(
-                0,
-                120,
-                &highUs
-            );
-
-        if (ok) {
-
-            data[i / 8] =
-                (uint8_t)(
-                    data[i / 8] << 1
-                );
-
-            if (highUs > lowUs) {
-                data[i / 8] |= 1;
+            {
+                break;
             }
         }
     }
 
-    portEXIT_CRITICAL(
-        &s_dhtLock
-    );
+    bool responseHigh =
+        (gpio_get_level(DHT_PIN) == 1);
 
-    if (!ok) {
+    if (responseLow && responseHigh)
+    {
+        start =
+            esp_timer_get_time();
 
-        ESP_LOGW(
-            TAG_DHT,
-            "no answer from DHT22"
-        );
+        while (gpio_get_level(DHT_PIN) == 1)
+        {
+            if (
+                (esp_timer_get_time() - start)
+                > DHT_TIMEOUT_US
+            )
+            {
+                break;
+            }
+        }
 
-        return false;
+        bool firstBitStarted =
+            (gpio_get_level(DHT_PIN) == 0);
+
+        if (firstBitStarted)
+        {
+            bool readOK = true;
+
+            for (int i = 0; i < 40; i++)
+            {
+                start =
+                    esp_timer_get_time();
+
+                while (gpio_get_level(DHT_PIN) == 0)
+                {
+                    if (
+                        (esp_timer_get_time() - start)
+                        > DHT_BIT_TIMEOUT_US
+                    )
+                    {
+                        readOK = false;
+                        break;
+                    }
+                }
+
+                if (!readOK)
+                    break;
+
+                int64_t highStart =
+                    esp_timer_get_time();
+
+                while (gpio_get_level(DHT_PIN) == 1)
+                {
+                    if (
+                        (esp_timer_get_time() - highStart)
+                        > DHT_BIT_TIMEOUT_US
+                    )
+                    {
+                        readOK = false;
+                        break;
+                    }
+                }
+
+                if (!readOK)
+                    break;
+
+                int64_t pulseLength =
+                    esp_timer_get_time()
+                    - highStart;
+
+                int byteIndex =
+                    i / 8;
+
+                int bitIndex =
+                    7 - (i % 8);
+
+                if (
+                    pulseLength
+                    > DHT_ONE_THRESHOLD_US
+                )
+                {
+                    data[byteIndex] |=
+                        (uint8_t)(
+                            1U << bitIndex
+                        );
+                }
+            }
+
+            if (readOK)
+            {
+                uint8_t checksum =
+                    (uint8_t)(
+                        data[0] +
+                        data[1] +
+                        data[2] +
+                        data[3]
+                    );
+
+                if (checksum == data[4])
+                {
+                    uint16_t rawHumidity =
+                        ((uint16_t)data[0] << 8)
+                        | data[1];
+
+                    uint16_t rawTemperature =
+                        ((uint16_t)data[2] << 8)
+                        | data[3];
+
+                    float newHumidity =
+                        rawHumidity / 10.0f;
+
+                    bool negative =
+                        (rawTemperature & 0x8000U)
+                        != 0;
+
+                    rawTemperature &=
+                        0x7FFFU;
+
+                    float newTemperature =
+                        rawTemperature / 10.0f;
+
+                    if (negative)
+                        newTemperature =
+                            -newTemperature;
+
+                    if (
+                        newHumidity >= 0.0f &&
+                        newHumidity <= 100.0f &&
+                        newTemperature >= -40.0f &&
+                        newTemperature <= 80.0f
+                    )
+                    {
+                        *humidity =
+                            newHumidity;
+
+                        *temperature =
+                            newTemperature;
+
+                        success = true;
+                    }
+                    else
+                    {
+                        printf(
+                            "DHT22 invalid values: "
+                            "T=%.2f C H=%.2f %%\n",
+                            newTemperature,
+                            newHumidity
+                        );
+                    }
+                }
+                else
+                {
+                    printf(
+                        "DHT22 checksum failed "
+                        "(calc=%u received=%u)\n",
+                        checksum,
+                        data[4]
+                    );
+                }
+            }
+            else
+            {
+                printf(
+                    "DHT22 timing/read failed\n"
+                );
+            }
+        }
     }
 
-    // Checksum
-    uint8_t sum =
-        (uint8_t)(
-            data[0] +
-            data[1] +
-            data[2] +
-            data[3]
-        );
-
-    if (sum != data[4]) {
-
-        ESP_LOGW(
-            TAG_DHT,
-            "checksum error"
-        );
-
-        return false;
-    }
-
-    // Convert humidity
-    float h =
-        (float)(
-            (data[0] << 8) |
-            data[1]
-        ) / 10.0f;
-
-    // Convert temperature
-    float t =
-        (float)(
-            ((data[2] & 0x7F) << 8) |
-            data[3]
-        ) / 10.0f;
-
-    if (data[2] & 0x80) {
-        t = -t;
-    }
-
-    // Sanity check
     if (
-        h < 0.0f ||
-        h > 100.0f ||
-        t < -40.0f ||
-        t > 80.0f
+        !success &&
+        !(responseLow && responseHigh)
     )
     {
-        ESP_LOGW(
-            TAG_DHT,
-            "value out of range"
+        printf(
+            "DHT22 sensor response timeout\n"
         );
-
-        return false;
     }
 
-    *temperature = t;
-    *humidity = h;
-
-    return true;
-}
-
-
-/* ============================== 4. LDR =============================== */
-
-static const char *TAG_LDR = "ldr";
-
-static adc_oneshot_unit_handle_t s_adc =
-    nullptr;
-
-
-static void ldrInit(void)
-{
-    adc_oneshot_unit_init_cfg_t unitCfg = {};
-
-    unitCfg.unit_id =
-        ADC_UNIT_1;
-
-    ESP_ERROR_CHECK(
-        adc_oneshot_new_unit(
-            &unitCfg,
-            &s_adc
-        )
+    gpio_set_direction(
+        DHT_PIN,
+        GPIO_MODE_INPUT
     );
 
-    adc_oneshot_chan_cfg_t chanCfg = {};
+    gpio_pullup_en(DHT_PIN);
 
-    chanCfg.atten =
-        ADC_ATTEN_DB_12;
+    portEXIT_CRITICAL(&dhtMux);
 
-    chanCfg.bitwidth =
-        ADC_BITWIDTH_DEFAULT;
-
-    ESP_ERROR_CHECK(
-        adc_oneshot_config_channel(
-            s_adc,
-            LDR_CHANNEL,
-            &chanCfg
-        )
-    );
+    return success;
 }
 
+// ====================================================
+// SENSOR TASK
+// ====================================================
 
-static int ldrReadPercent(void)
+void sensorTask(void *parameter)
 {
-    int raw = 0;
-
-    esp_err_t err =
-        adc_oneshot_read(
-            s_adc,
-            LDR_CHANNEL,
-            &raw
-        );
-
-    if (err != ESP_OK) {
-
-        ESP_LOGW(
-            TAG_LDR,
-            "ADC read failed: %s",
-            esp_err_to_name(err)
-        );
-
-        return -1;
-    }
-
-    int percent =
-        100 -
-        (raw * 100) / 4095;
-
-    if (percent < 0) {
-        percent = 0;
-    }
-
-    if (percent > 100) {
-        percent = 100;
-    }
-
-    return percent;
-}
-
-
-/* ========================== 5. SENSOR TASK =========================== */
-
-static const char *TAG_SENSOR =
-    "SensorTask";
-
-
-static void sensorTask(
-    void *pvParameters
-)
-{
-    (void)pvParameters;
-
-    SensorData data = {
-        NAN,
-        NAN,
-        0,
-        false
-    };
-
-    // Give DHT22 time to start
-    vTaskDelay(
-        pdMS_TO_TICKS(1000)
-    );
+    SensorData sensorData = {};
 
     TickType_t lastWakeTime =
         xTaskGetTickCount();
 
-    for (;;) {
+    adc_oneshot_unit_handle_t adc_handle =
+        NULL;
 
-        float t = 0.0f;
-        float h = 0.0f;
+    adc_oneshot_unit_init_cfg_t init_config = {};
 
-        if (dht22Read(&t, &h)) {
+    init_config.unit_id =
+        ADC_UNIT_1;
 
-            data.temperature = t;
-            data.humidity = h;
+    init_config.clk_src =
+        ADC_RTC_CLK_SRC_DEFAULT;
 
-            ESP_LOGI(
-                TAG_SENSOR,
-                "Temperature: %.2f C  Humidity: %.2f %%",
-                t,
-                h
-            );
+    init_config.ulp_mode =
+        ADC_ULP_MODE_DISABLE;
 
-            /*
-             * Task 30:
-             * Temperature decision logic is kept separate
-             * from the hardware/buzzer control.
-             */
-            AlarmState alarmState =
-                evaluateTemperature(t);
-
-            switch (alarmState) {
-
-                case AlarmState::NORMAL:
-                    ESP_LOGI(
-                        TAG_SENSOR,
-                        "AlarmState: NORMAL"
-                    );
-                    break;
-
-                case AlarmState::LOW_TEMPERATURE:
-                    ESP_LOGW(
-                        TAG_SENSOR,
-                        "AlarmState: LOW_TEMPERATURE"
-                    );
-                    break;
-
-                case AlarmState::HIGH_TEMPERATURE:
-                    ESP_LOGW(
-                        TAG_SENSOR,
-                        "AlarmState: HIGH_TEMPERATURE"
-                    );
-                    break;
-            }
-        }
-        else {
-
-            ESP_LOGW(
-                TAG_SENSOR,
-                "DHT22 read failed - keeping last values"
-            );
-        }
-
-        int light =
-            ldrReadPercent();
-
-        if (light >= 0) {
-            data.lightLevel = light;
-        }
-
-        ESP_LOGI(
-            TAG_SENSOR,
-            "Light: %d %%",
-            data.lightLevel
+    esp_err_t result =
+        adc_oneshot_new_unit(
+            &init_config,
+            &adc_handle
         );
 
+    if (result != ESP_OK)
+    {
+        printf(
+            "LDR ADC initialization failed: %s\n",
+            esp_err_to_name(result)
+        );
+
+        vTaskDelete(NULL);
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t channel_config = {};
+
+    channel_config.atten =
+        ADC_ATTEN_DB_12;
+
+    channel_config.bitwidth =
+        ADC_BITWIDTH_12;
+
+    result =
+        adc_oneshot_config_channel(
+            adc_handle,
+            LDR_ADC_CHANNEL,
+            &channel_config
+        );
+
+    if (result != ESP_OK)
+    {
+        printf(
+            "LDR ADC channel configuration failed: %s\n",
+            esp_err_to_name(result)
+        );
+
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sensorData.temperature = 0.0f;
+    sensorData.humidity = 0.0f;
+    sensorData.lightLevel = 0;
+    sensorData.motionDetected = false;
+
+    bool haveValidDhtReading = false;
+
+    printf(
+        "SensorTask: Started on CPU %d\n",
+        xPortGetCoreID()
+    );
+
+    while (1)
+    {
+        // --------------------------------------------
+        // DHT22
+        // --------------------------------------------
+
+        float newTemperature = 0.0f;
+        float newHumidity = 0.0f;
+
         if (
-            xQueueSend(
-                g_sensorQueue,
-                &data,
-                0
-            ) != pdTRUE
+            dht22_read(
+                &newTemperature,
+                &newHumidity
+            )
         )
         {
-            ESP_LOGW(
-                TAG_SENSOR,
-                "sensor queue full - reading dropped"
+            sensorData.temperature =
+                newTemperature;
+
+            sensorData.humidity =
+                newHumidity;
+
+            haveValidDhtReading =
+                true;
+        }
+        else
+        {
+            if (haveValidDhtReading)
+            {
+                printf(
+                    "DHT22 reading failed - "
+                    "keeping previous valid reading\n"
+                );
+            }
+            else
+            {
+                printf(
+                    "DHT22 reading failed - "
+                    "no valid reading yet\n"
+                );
+            }
+        }
+
+        // --------------------------------------------
+        // LDR
+        // --------------------------------------------
+
+        int raw_value = 0;
+
+        result =
+            adc_oneshot_read(
+                adc_handle,
+                LDR_ADC_CHANNEL,
+                &raw_value
+            );
+
+        if (result == ESP_OK)
+        {
+            sensorData.lightLevel =
+                (int)(
+                    (raw_value / 4095.0f)
+                    * 100.0f
+                );
+
+            if (sensorData.lightLevel < 0)
+                sensorData.lightLevel = 0;
+
+            if (sensorData.lightLevel > 100)
+                sensorData.lightLevel = 100;
+        }
+        else
+        {
+            sensorData.lightLevel = 0;
+        }
+
+        // --------------------------------------------
+        // MOTION STATE
+        // --------------------------------------------
+
+        sensorData.motionDetected =
+            motionDetected;
+
+        // --------------------------------------------
+        // SERIAL OUTPUT
+        // --------------------------------------------
+
+        printf(
+            "Temperature: %.2f C\n",
+            sensorData.temperature
+        );
+
+        printf(
+            "Humidity: %.2f %%\n",
+            sensorData.humidity
+        );
+
+        printf(
+            "Light Level: %d %%\n",
+            sensorData.lightLevel
+        );
+
+        printf(
+            "Motion: %s\n",
+            sensorData.motionDetected
+                ? "DETECTED"
+                : "NONE"
+        );
+
+        if (haveValidDhtReading)
+        {
+            xQueueOverwrite(
+                displayQueue,
+                &sensorData
+            );
+
+            xQueueOverwrite(
+                alarmQueue,
+                &sensorData
+            );
+
+            printf(
+                "Sensor data sent to queues\n"
             );
         }
 
-        // Periodic execution
         vTaskDelayUntil(
             &lastWakeTime,
-            pdMS_TO_TICKS(
-                SENSOR_PERIOD_MS
-            )
+            pdMS_TO_TICKS(2000)
         );
     }
 }
 
+// ====================================================
+// MOTION TASK
+// ====================================================
+//
+// ACTIVE   -- no motion for 15 seconds --> INACTIVE
+// INACTIVE -- motion detected ---------> ACTIVE
+//
+// ====================================================
 
-/* ========================== 6. OLED DRIVER =========================== */
-
-static const char *TAG_OLED =
-    "oled";
-
-static const int OLED_WIDTH  = 128;
-static const int OLED_HEIGHT = 64;
-static const int OLED_PAGES =
-    OLED_HEIGHT / 8;
-
-static i2c_master_bus_handle_t s_i2cBus =
-    nullptr;
-
-static i2c_master_dev_handle_t s_oled =
-    nullptr;
-
-static uint8_t s_fb[
-    OLED_WIDTH * OLED_PAGES
-];
-
-
-struct Glyph {
-    char ch;
-    uint8_t col[5];
-};
-
-
-static const Glyph FONT[] = {
-    {' ', {0x00, 0x00, 0x00, 0x00, 0x00}},
-    {'.', {0x00, 0x60, 0x60, 0x00, 0x00}},
-    {'%', {0x23, 0x13, 0x08, 0x64, 0x62}},
-    {':', {0x00, 0x36, 0x36, 0x00, 0x00}},
-    {'-', {0x08, 0x08, 0x08, 0x08, 0x08}},
-    {'/', {0x20, 0x10, 0x08, 0x04, 0x02}},
-
-    {'0', {0x3E, 0x51, 0x49, 0x45, 0x3E}},
-    {'1', {0x00, 0x42, 0x7F, 0x40, 0x00}},
-    {'2', {0x42, 0x61, 0x51, 0x49, 0x46}},
-    {'3', {0x21, 0x41, 0x45, 0x4B, 0x31}},
-    {'4', {0x18, 0x14, 0x12, 0x7F, 0x10}},
-    {'5', {0x27, 0x45, 0x45, 0x45, 0x39}},
-    {'6', {0x3C, 0x4A, 0x49, 0x49, 0x30}},
-    {'7', {0x01, 0x71, 0x09, 0x05, 0x03}},
-    {'8', {0x36, 0x49, 0x49, 0x49, 0x36}},
-    {'9', {0x06, 0x49, 0x49, 0x29, 0x1E}},
-
-    {'A', {0x7E, 0x11, 0x11, 0x11, 0x7E}},
-    {'B', {0x7F, 0x49, 0x49, 0x49, 0x36}},
-    {'C', {0x3E, 0x41, 0x41, 0x41, 0x22}},
-    {'D', {0x7F, 0x41, 0x41, 0x22, 0x1C}},
-    {'E', {0x7F, 0x49, 0x49, 0x49, 0x41}},
-    {'F', {0x7F, 0x09, 0x09, 0x09, 0x01}},
-    {'G', {0x3E, 0x41, 0x49, 0x49, 0x7A}},
-    {'H', {0x7F, 0x08, 0x08, 0x08, 0x7F}},
-    {'I', {0x00, 0x41, 0x7F, 0x41, 0x00}},
-    {'J', {0x20, 0x40, 0x41, 0x3F, 0x01}},
-    {'K', {0x7F, 0x08, 0x14, 0x22, 0x41}},
-    {'L', {0x7F, 0x40, 0x40, 0x40, 0x40}},
-    {'M', {0x7F, 0x02, 0x0C, 0x02, 0x7F}},
-    {'N', {0x7F, 0x04, 0x08, 0x10, 0x7F}},
-    {'O', {0x3E, 0x41, 0x41, 0x41, 0x3E}},
-    {'P', {0x7F, 0x09, 0x09, 0x09, 0x06}},
-    {'Q', {0x3E, 0x41, 0x51, 0x21, 0x5E}},
-    {'R', {0x7F, 0x09, 0x19, 0x29, 0x46}},
-    {'S', {0x46, 0x49, 0x49, 0x49, 0x31}},
-    {'T', {0x01, 0x01, 0x7F, 0x01, 0x01}},
-    {'U', {0x3F, 0x40, 0x40, 0x40, 0x3F}},
-    {'V', {0x1F, 0x20, 0x40, 0x20, 0x1F}},
-    {'W', {0x3F, 0x40, 0x38, 0x40, 0x3F}},
-    {'X', {0x63, 0x14, 0x08, 0x14, 0x63}},
-    {'Y', {0x07, 0x08, 0x70, 0x08, 0x07}},
-    {'Z', {0x61, 0x51, 0x49, 0x45, 0x43}}
-};
-
-
-static const uint8_t *findGlyph(char c)
+void motionTask(void *parameter)
 {
-    if (
-        c >= 'a' &&
-        c <= 'z'
-    )
-    {
-        c =
-            (char)(
-                c - 32
-            );
-    }
-
-    for (
-        size_t i = 0;
-        i < sizeof(FONT) / sizeof(FONT[0]);
-        i++
-    )
-    {
-        if (FONT[i].ch == c) {
-            return FONT[i].col;
-        }
-    }
-
-    return FONT[0].col;
-}
-
-
-static void oledCommands(
-    const uint8_t *cmds,
-    size_t n
-)
-{
-    uint8_t buf[40];
-
-    if (
-        n >
-        sizeof(buf) - 1
-    )
-    {
-        return;
-    }
-
-    buf[0] = 0x00;
-
-    memcpy(
-        &buf[1],
-        cmds,
-        n
+    gpio_set_direction(
+        PIR_PIN,
+        GPIO_MODE_INPUT
     );
 
-    esp_err_t err =
-        i2c_master_transmit(
-            s_oled,
-            buf,
-            n + 1,
-            100
-        );
+    gpio_pulldown_en(PIR_PIN);
 
-    if (err != ESP_OK) {
+    int64_t lastMotionTime =
+        esp_timer_get_time();
 
-        ESP_LOGW(
-            TAG_OLED,
-            "I2C command failed: %s",
-            esp_err_to_name(err)
-        );
-    }
-}
+    bool lastPirLevel = false;
 
-
-static void oledInit(void)
-{
-    i2c_master_bus_config_t busCfg = {};
-
-    busCfg.i2c_port =
-        I2C_NUM_0;
-
-    busCfg.sda_io_num =
-        OLED_SDA_PIN;
-
-    busCfg.scl_io_num =
-        OLED_SCL_PIN;
-
-    busCfg.clk_source =
-        I2C_CLK_SRC_DEFAULT;
-
-    busCfg.glitch_ignore_cnt =
-        7;
-
-    busCfg.flags.enable_internal_pullup =
-        true;
-
-    ESP_ERROR_CHECK(
-        i2c_new_master_bus(
-            &busCfg,
-            &s_i2cBus
-        )
+    printf(
+        "MotionTask: Started on CPU %d\n",
+        xPortGetCoreID()
     );
 
-    i2c_device_config_t devCfg = {};
-
-    devCfg.dev_addr_length =
-        I2C_ADDR_BIT_LEN_7;
-
-    devCfg.device_address =
-        OLED_I2C_ADDR;
-
-    devCfg.scl_speed_hz =
-        400000;
-
-    ESP_ERROR_CHECK(
-        i2c_master_bus_add_device(
-            s_i2cBus,
-            &devCfg,
-            &s_oled
-        )
-    );
-
-    static const uint8_t initSeq[] = {
-        0xAE,
-        0xD5, 0x80,
-        0xA8, 0x3F,
-        0xD3, 0x00,
-        0x40,
-        0x8D, 0x14,
-        0x20, 0x02,
-        0xA1,
-        0xC8,
-        0xDA, 0x12,
-        0x81, 0xCF,
-        0xD9, 0xF1,
-        0xDB, 0x40,
-        0xA4,
-        0xA6,
-        0xAF
-    };
-
-    oledCommands(
-        initSeq,
-        sizeof(initSeq)
-    );
-}
-
-
-static void oledClear(void)
-{
-    memset(
-        s_fb,
-        0,
-        sizeof(s_fb)
-    );
-}
-
-
-static void oledPixel(
-    int x,
-    int y
-)
-{
-    if (
-        x < 0 ||
-        x >= OLED_WIDTH ||
-        y < 0 ||
-        y >= OLED_HEIGHT
-    )
+    while (1)
     {
-        return;
-    }
+        bool pirLevel =
+            gpio_get_level(PIR_PIN) != 0;
 
-    s_fb[
-        (y / 8) * OLED_WIDTH + x
-    ] |=
-        (uint8_t)(
-            1 << (y % 8)
-        );
-}
+        int64_t now =
+            esp_timer_get_time();
 
+        // --------------------------------------------
+        // PIR ACTIVITY
+        // --------------------------------------------
 
-static void oledDrawChar(
-    int x,
-    int y,
-    char c,
-    int scale
-)
-{
-    const uint8_t *cols =
-        findGlyph(c);
-
-    for (
-        int col = 0;
-        col < 5;
-        col++
-    )
-    {
-        for (
-            int row = 0;
-            row < 7;
-            row++
-        )
+        if (pirLevel)
         {
-            if (
-                cols[col] &
-                (1 << row)
-            )
+            lastMotionTime = now;
+
+            motionDetected = true;
+
+            if (!lastPirLevel)
             {
-                for (
-                    int dx = 0;
-                    dx < scale;
-                    dx++
-                )
-                {
-                    for (
-                        int dy = 0;
-                        dy < scale;
-                        dy++
-                    )
-                    {
-                        oledPixel(
-                            x +
-                                col * scale +
-                                dx,
-                            y +
-                                row * scale +
-                                dy
-                        );
-                    }
-                }
+                printf(
+                    "MotionTask: MOTION DETECTED\n"
+                );
+            }
+
+            if (systemState == SystemState::INACTIVE)
+            {
+                systemState =
+                    SystemState::ACTIVE;
+
+                printf(
+                    "System entering ACTIVE mode\n"
+                );
             }
         }
-    }
-}
 
+        lastPirLevel =
+            pirLevel;
 
-static void oledDrawText(
-    int x,
-    int y,
-    const char *text,
-    int scale
-)
-{
-    for (
-        ;
-        *text != '\0';
-        text++
-    )
-    {
-        oledDrawChar(
-            x,
-            y,
-            *text,
-            scale
-        );
-
-        x +=
-            6 * scale;
-    }
-}
-
-
-static void oledDrawHLine(
-    int y
-)
-{
-    for (
-        int x = 0;
-        x < OLED_WIDTH;
-        x++
-    )
-    {
-        oledPixel(
-            x,
-            y
-        );
-    }
-}
-
-
-static void oledFlush(void)
-{
-    uint8_t buf[
-        1 + OLED_WIDTH
-    ];
-
-    for (
-        int page = 0;
-        page < OLED_PAGES;
-        page++
-    )
-    {
-        const uint8_t setPos[] = {
-            (uint8_t)(
-                0xB0 | page
-            ),
-            0x00,
-            0x10
-        };
-
-        oledCommands(
-            setPos,
-            sizeof(setPos)
-        );
-
-        buf[0] = 0x40;
-
-        memcpy(
-            &buf[1],
-            &s_fb[
-                page * OLED_WIDTH
-            ],
-            OLED_WIDTH
-        );
-
-        esp_err_t err =
-            i2c_master_transmit(
-                s_oled,
-                buf,
-                sizeof(buf),
-                100
-            );
-
-        if (err != ESP_OK) {
-
-            ESP_LOGW(
-                TAG_OLED,
-                "I2C data failed: %s",
-                esp_err_to_name(err)
-            );
-
-            return;
-        }
-    }
-}
-
-
-/* ========================= 7. DISPLAY TASK =========================== */
-
-static void renderScreen(
-    DisplayMode mode,
-    const SensorData &d
-)
-{
-    const char *label = "";
-
-    char value[48] = "";
-
-    char page[16];
-
-    switch (mode) {
-
-        case DisplayMode::TEMPERATURE:
-
-            label = "TEMPERATURE";
-
-            if (
-                std::isnan(
-                    d.temperature
-                )
-            )
-            {
-                snprintf(
-                    value,
-                    sizeof(value),
-                    "-- C"
-                );
-            }
-            else
-            {
-                snprintf(
-                    value,
-                    sizeof(value),
-                    "%.1f C",
-                    d.temperature
-                );
-            }
-
-            break;
-
-
-        case DisplayMode::HUMIDITY:
-
-            label = "HUMIDITY";
-
-            if (
-                std::isnan(
-                    d.humidity
-                )
-            )
-            {
-                snprintf(
-                    value,
-                    sizeof(value),
-                    "-- %%"
-                );
-            }
-            else
-            {
-                snprintf(
-                    value,
-                    sizeof(value),
-                    "%.1f %%",
-                    d.humidity
-                );
-            }
-
-            break;
-
-
-        case DisplayMode::LIGHT:
-
-            label = "LIGHT";
-
-            snprintf(
-                value,
-                sizeof(value),
-                "%d %%",
-                d.lightLevel
-            );
-
-            break;
-
-
-        case DisplayMode::MOTION:
-
-            label = "MOTION";
-
-            snprintf(
-                value,
-                sizeof(value),
-                "%s",
-                d.motionDetected
-                    ? "YES"
-                    : "NONE"
-            );
-
-            break;
-    }
-
-    snprintf(
-        page,
-        sizeof(page),
-        "%d/4",
-        (int)mode + 1
-    );
-
-    oledClear();
-
-    oledDrawText(
-        0,
-        0,
-        "ROOM MONITOR",
-        1
-    );
-
-    oledDrawText(
-        110,
-        0,
-        page,
-        1
-    );
-
-    oledDrawHLine(
-        10
-    );
-
-    oledDrawText(
-        0,
-        16,
-        label,
-        1
-    );
-
-    oledDrawText(
-        0,
-        30,
-        value,
-        3
-    );
-
-    oledDrawText(
-        0,
-        56,
-        "TURN KNOB TO CHANGE",
-        1
-    );
-
-    oledFlush();
-}
-
-
-static void displayTask(
-    void *pvParameters
-)
-{
-    (void)pvParameters;
-
-    SensorData data = {
-        NAN,
-        NAN,
-        0,
-        false
-    };
-
-    DisplayMode mode =
-        DisplayMode::TEMPERATURE;
-
-    bool redraw = true;
-
-    oledInit();
-
-    for (;;) {
-
-        if (redraw) {
-
-            renderScreen(
-                mode,
-                data
-            );
-
-            redraw = false;
-        }
-
-        DisplayMode newMode;
+        // --------------------------------------------
+        // INACTIVITY TIMEOUT
+        // --------------------------------------------
 
         if (
-            xQueueReceive(
-                g_displayModeQueue,
-                &newMode,
-                pdMS_TO_TICKS(50)
-            ) == pdTRUE
+            systemState == SystemState::ACTIVE &&
+            (now - lastMotionTime)
+                >= INACTIVITY_TIMEOUT_US
         )
         {
-            mode =
-                newMode;
+            motionDetected = false;
 
-            redraw = true;
+            systemState =
+                SystemState::INACTIVE;
+
+            printf(
+                "MotionTask: NO MOTION - "
+                "15 SECOND TIMEOUT\n"
+            );
+
+            printf(
+                "System entering INACTIVE mode\n"
+            );
         }
 
-        SensorData newData;
-
-        while (
-            xQueueReceive(
-                g_sensorQueue,
-                &newData,
-                0
-            ) == pdTRUE
-        )
-        {
-            data =
-                newData;
-
-            redraw = true;
-        }
+        vTaskDelay(
+            ms_to_ticks(100)
+        );
     }
 }
 
+// ====================================================
+// ENCODER INTERRUPT
+// ====================================================
 
-/* =========================== 8. INPUT TASK =========================== */
-
-enum class EncoderEvent : uint8_t {
-    CLOCKWISE,
-    COUNTER_CLOCKWISE
-};
-
-
-static void IRAM_ATTR encoderIsr(
-    void *arg
-)
+static void IRAM_ATTR encoderIsr(void *arg)
 {
-    (void)arg;
+    int8_t direction =
+        (gpio_get_level(ENCODER_DT) != 0)
+            ? 1
+            : -1;
 
-    EncoderEvent ev =
-        (
-            gpio_get_level(
-                ENC_DT_PIN
-            ) == 1
-        )
-        ?
-        EncoderEvent::CLOCKWISE
-        :
-        EncoderEvent::COUNTER_CLOCKWISE;
+    if (ENCODER_REVERSE)
+        direction = -direction;
 
-    BaseType_t woken =
+    BaseType_t higherPriorityTaskWoken =
         pdFALSE;
 
     xQueueSendFromISR(
-        g_encoderQueue,
-        &ev,
-        &woken
+        encoderQueue,
+        &direction,
+        &higherPriorityTaskWoken
     );
 
-    portYIELD_FROM_ISR(
-        woken
-    );
+    if (higherPriorityTaskWoken == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
 }
 
+// ====================================================
+// INPUT TASK
+// ====================================================
 
-static void encoderInit(void)
+void inputTask(void *parameter)
 {
-    gpio_config_t cfg = {};
-
-    cfg.pin_bit_mask =
-        (1ULL << ENC_CLK_PIN) |
-        (1ULL << ENC_DT_PIN);
-
-    cfg.mode =
-        GPIO_MODE_INPUT;
-
-    cfg.pull_up_en =
-        GPIO_PULLUP_ENABLE;
-
-    cfg.pull_down_en =
-        GPIO_PULLDOWN_DISABLE;
-
-    cfg.intr_type =
-        GPIO_INTR_DISABLE;
-
-    ESP_ERROR_CHECK(
-        gpio_config(&cfg)
+    gpio_set_direction(
+        ENCODER_CLK,
+        GPIO_MODE_INPUT
     );
 
-    ESP_ERROR_CHECK(
-        gpio_set_intr_type(
-            ENC_CLK_PIN,
-            GPIO_INTR_NEGEDGE
-        )
+    gpio_set_direction(
+        ENCODER_DT,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_set_direction(
+        ENCODER_SW,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_pullup_en(ENCODER_CLK);
+    gpio_pullup_en(ENCODER_DT);
+    gpio_pullup_en(ENCODER_SW);
+
+    gpio_set_intr_type(
+        ENCODER_CLK,
+        GPIO_INTR_NEGEDGE
     );
 
     esp_err_t err =
@@ -1258,81 +1283,440 @@ static void encoderInit(void)
         err != ESP_ERR_INVALID_STATE
     )
     {
-        ESP_ERROR_CHECK(err);
+        printf(
+            "gpio_install_isr_service failed: %s\n",
+            esp_err_to_name(err)
+        );
     }
 
-    ESP_ERROR_CHECK(
-        gpio_isr_handler_add(
-            ENC_CLK_PIN,
-            encoderIsr,
-            nullptr
-        )
+    gpio_isr_handler_add(
+        ENCODER_CLK,
+        encoderIsr,
+        NULL
     );
-}
 
-
-static void inputTask(
-    void *pvParameters
-)
-{
-    (void)pvParameters;
-
-    DisplayMode mode =
+    DisplayMode currentMode =
         DisplayMode::TEMPERATURE;
 
-    EncoderEvent ev;
+    bool lastButton =
+        gpio_get_level(ENCODER_SW);
 
-    for (;;) {
+    printf(
+        "InputTask: Started on CPU %d\n",
+        xPortGetCoreID()
+    );
+
+    while (1)
+    {
+        int8_t direction = 0;
 
         if (
             xQueueReceive(
-                g_encoderQueue,
-                &ev,
-                portMAX_DELAY
-            ) == pdTRUE
+                encoderQueue,
+                &direction,
+                ms_to_ticks(20)
+            ) == pdPASS
         )
         {
-            if (
-                ev ==
-                EncoderEvent::CLOCKWISE
-            )
+            if (systemState == SystemState::ACTIVE)
             {
-                mode =
-                    nextDisplayMode(
-                        mode
-                    );
+                if (direction > 0)
+                {
+                    currentMode =
+                        nextMode(currentMode);
 
-                printf(
-                    "Clockwise -> DisplayMode: %d\n",
-                    (int)mode
+                    printf(
+                        "InputTask: clockwise -> %s\n",
+                        modeToString(currentMode)
+                    );
+                }
+                else
+                {
+                    currentMode =
+                        previousMode(currentMode);
+
+                    printf(
+                        "InputTask: counter-clockwise -> %s\n",
+                        modeToString(currentMode)
+                    );
+                }
+
+                xQueueOverwrite(
+                    modeQueue,
+                    &currentMode
                 );
             }
-            else
-            {
-                mode =
-                    previousDisplayMode(
-                        mode
-                    );
+        }
 
-                printf(
-                    "Counterclockwise -> DisplayMode: %d\n",
-                    (int)mode
-                );
-            }
+        bool currentButton =
+            gpio_get_level(ENCODER_SW);
+
+        if (
+            lastButton == 1 &&
+            currentButton == 0 &&
+            systemState == SystemState::ACTIVE
+        )
+        {
+            currentMode =
+                nextMode(currentMode);
 
             xQueueOverwrite(
-                g_displayModeQueue,
-                &mode
+                modeQueue,
+                &currentMode
             );
+
+            printf(
+                "InputTask: button pressed -> %s\n",
+                modeToString(currentMode)
+            );
+
+            vTaskDelay(
+                ms_to_ticks(200)
+            );
+        }
+
+        lastButton =
+            currentButton;
+    }
+}
+
+// ====================================================
+// DISPLAY PAGE DRAWING
+// ====================================================
+
+static void drawPage(
+    DisplayMode mode,
+    const SensorData &data
+)
+{
+    char line[16];
+
+    oled_clear();
+
+    oled_text(
+        0,
+        0,
+        "ROOM MONITOR"
+    );
+
+    switch (mode)
+    {
+        case DisplayMode::TEMPERATURE:
+
+            oled_text_big(
+                0,
+                2,
+                "TEMP"
+            );
+
+            snprintf(
+                line,
+                sizeof(line),
+                "%.1f C",
+                data.temperature
+            );
+
+            oled_text_big(
+                0,
+                5,
+                line
+            );
+
+            printf(
+                "DisplayTask: "
+                "Temperature page = %.2f C\n",
+                data.temperature
+            );
+
+            break;
+
+        case DisplayMode::HUMIDITY:
+
+            oled_text_big(
+                0,
+                2,
+                "HUMIDITY"
+            );
+
+            snprintf(
+                line,
+                sizeof(line),
+                "%d %%",
+                (int)data.humidity
+            );
+
+            oled_text_big(
+                0,
+                5,
+                line
+            );
+
+            printf(
+                "DisplayTask: "
+                "Humidity page = %.2f %%\n",
+                data.humidity
+            );
+
+            break;
+
+        case DisplayMode::LIGHT:
+
+            oled_text_big(
+                0,
+                2,
+                "LIGHT"
+            );
+
+            snprintf(
+                line,
+                sizeof(line),
+                "%d %%",
+                data.lightLevel
+            );
+
+            oled_text_big(
+                0,
+                5,
+                line
+            );
+
+            printf(
+                "DisplayTask: "
+                "Light page = %d %%\n",
+                data.lightLevel
+            );
+
+            break;
+
+        case DisplayMode::MOTION:
+
+            oled_text_big(
+                0,
+                2,
+                "MOTION"
+            );
+
+            oled_text_big(
+                0,
+                5,
+                motionDetected
+                    ? "DETECTED"
+                    : "NONE"
+            );
+
+            printf(
+                "DisplayTask: Motion page = %s\n",
+                motionDetected
+                    ? "DETECTED"
+                    : "NONE"
+            );
+
+            break;
+    }
+}
+
+// ====================================================
+// DISPLAY TASK
+// ====================================================
+//
+// DisplayTask is the ONLY task that accesses the OLED.
+//
+// ====================================================
+
+void displayTask(void *parameter)
+{
+    SensorData sensorData = {};
+
+    DisplayMode currentMode =
+        DisplayMode::TEMPERATURE;
+
+    bool haveData = false;
+    bool displayOn = true;
+    bool needRedraw = true;
+    bool lastMotionShown = false;
+
+    oled_init();
+    oled_clear();
+
+    printf(
+        "DisplayTask: Started on CPU %d\n",
+        xPortGetCoreID()
+    );
+
+    while (1)
+    {
+        if (
+            xQueueReceive(
+                displayQueue,
+                &sensorData,
+                ms_to_ticks(20)
+            ) == pdPASS
+        )
+        {
+            haveData = true;
+            needRedraw = true;
+        }
+
+        DisplayMode newMode;
+
+        if (
+            xQueueReceive(
+                modeQueue,
+                &newMode,
+                0
+            ) == pdPASS
+        )
+        {
+            currentMode =
+                newMode;
+
+            needRedraw = true;
+        }
+
+        // --------------------------------------------
+        // INACTIVE
+        // --------------------------------------------
+
+        if (systemState != SystemState::ACTIVE)
+        {
+            if (displayOn)
+            {
+                oled_clear();
+
+                oled_power(false);
+
+                displayOn = false;
+
+                printf(
+                    "DisplayTask: OLED OFF - "
+                    "system INACTIVE\n"
+                );
+            }
+
+            continue;
+        }
+
+        // --------------------------------------------
+        // ACTIVE
+        // --------------------------------------------
+
+        if (!displayOn)
+        {
+            oled_power(true);
+
+            displayOn = true;
+
+            needRedraw = true;
+
+            printf(
+                "DisplayTask: OLED ON - "
+                "system ACTIVE\n"
+            );
+        }
+
+        if (
+            currentMode == DisplayMode::MOTION &&
+            motionDetected != lastMotionShown
+        )
+        {
+            needRedraw = true;
+        }
+
+        if (!haveData || !needRedraw)
+            continue;
+
+        needRedraw = false;
+
+        lastMotionShown =
+            motionDetected;
+
+        drawPage(
+            currentMode,
+            sensorData
+        );
+    }
+}
+
+// ====================================================
+// ALARM TASK
+// ====================================================
+//
+// evaluateTemperature() is implemented in alarm.cpp.
+// This task only consumes sensor data and reacts to the
+// resulting AlarmState.
+//
+// ====================================================
+
+void alarmTask(void *parameter)
+{
+    SensorData sensorData = {};
+
+    AlarmState lastState =
+        AlarmState::NORMAL;
+
+    bool firstEvaluation = true;
+
+    printf(
+        "AlarmTask: Started on CPU %d\n",
+        xPortGetCoreID()
+    );
+
+    while (1)
+    {
+        if (
+            xQueueReceive(
+                alarmQueue,
+                &sensorData,
+                portMAX_DELAY
+            ) == pdPASS
+        )
+        {
+            if (systemState != SystemState::ACTIVE)
+            {
+                firstEvaluation = true;
+                continue;
+            }
+
+            AlarmState state =
+                evaluateTemperature(
+                    sensorData.temperature
+                );
+
+            if (
+                firstEvaluation ||
+                state != lastState
+            )
+            {
+                printf(
+                    "Alarm State: %s (%.1f C)\n",
+                    alarmStateToString(state),
+                    sensorData.temperature
+                );
+
+                // Buzzer hardware control can be added here.
+
+                lastState =
+                    state;
+
+                firstEvaluation =
+                    false;
+            }
         }
     }
 }
 
-
-/* ============================ 9. APP_MAIN ============================ */
+// ====================================================
+// MAIN
+// ====================================================
 
 extern "C" void app_main(void)
 {
+    printf("\n");
+
+    printf(
+        "====================================\n"
+    );
+
     printf(
         "BCA152 FreeRTOS Multisensor\n"
     );
@@ -1341,73 +1725,201 @@ extern "C" void app_main(void)
         "System starting...\n"
     );
 
-    /* ----------------------- Create queues -------------------------- */
+    printf(
+        "====================================\n"
+    );
 
-    g_sensorQueue =
+    // --------------------------------------------
+    // DHT22 IDLE STATE
+    // --------------------------------------------
+
+    gpio_set_direction(
+        DHT_PIN,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_pullup_en(DHT_PIN);
+
+    // --------------------------------------------
+    // PIR
+    // --------------------------------------------
+
+    gpio_set_direction(
+        PIR_PIN,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_pulldown_en(PIR_PIN);
+
+    // --------------------------------------------
+    // CREATE QUEUES
+    // --------------------------------------------
+
+    displayQueue =
         xQueueCreate(
-            5,
+            1,
             sizeof(SensorData)
         );
 
-    g_displayModeQueue =
+    alarmQueue =
+        xQueueCreate(
+            1,
+            sizeof(SensorData)
+        );
+
+    modeQueue =
         xQueueCreate(
             1,
             sizeof(DisplayMode)
         );
 
-    g_encoderQueue =
+    encoderQueue =
         xQueueCreate(
-            16,
-            sizeof(EncoderEvent)
+            8,
+            sizeof(int8_t)
         );
 
     if (
-        g_sensorQueue == nullptr ||
-        g_displayModeQueue == nullptr ||
-        g_encoderQueue == nullptr
+        displayQueue == NULL ||
+        alarmQueue == NULL ||
+        modeQueue == NULL ||
+        encoderQueue == NULL
     )
     {
         printf(
-            "ERROR: could not create queues\n"
+            "ERROR: Failed to create queues\n"
         );
 
         return;
     }
 
-    /* -------------------- Initialize hardware ----------------------- */
-
-    dht22Init();
-
-    ldrInit();
-
-    encoderInit();
-
-    /* ------------------------- Tasks -------------------------------- */
-
-    xTaskCreate(
-        sensorTask,
-        "SensorTask",
-        4096,
-        nullptr,
-        PRIO_SENSOR,
-        nullptr
+    printf(
+        "Queues created successfully.\n"
     );
 
-    xTaskCreate(
-        displayTask,
-        "DisplayTask",
-        6144,
-        nullptr,
-        PRIO_DISPLAY,
-        nullptr
-    );
+    BaseType_t result;
 
-    xTaskCreate(
-        inputTask,
-        "InputTask",
-        4096,
-        nullptr,
-        PRIO_INPUT,
-        nullptr
+    // --------------------------------------------
+    // SENSOR TASK - CPU0
+    // --------------------------------------------
+
+    result =
+        xTaskCreatePinnedToCore(
+            sensorTask,
+            "SensorTask",
+            6144,
+            NULL,
+            2,
+            NULL,
+            0
+        );
+
+    if (result != pdPASS)
+    {
+        printf(
+            "ERROR: SensorTask creation failed\n"
+        );
+
+        return;
+    }
+
+    // --------------------------------------------
+    // MOTION TASK - CPU0
+    // --------------------------------------------
+
+    result =
+        xTaskCreatePinnedToCore(
+            motionTask,
+            "MotionTask",
+            4096,
+            NULL,
+            2,
+            NULL,
+            0
+        );
+
+    if (result != pdPASS)
+    {
+        printf(
+            "ERROR: MotionTask creation failed\n"
+        );
+
+        return;
+    }
+
+    // --------------------------------------------
+    // INPUT TASK - CPU1
+    // --------------------------------------------
+
+    result =
+        xTaskCreatePinnedToCore(
+            inputTask,
+            "InputTask",
+            4096,
+            NULL,
+            2,
+            NULL,
+            1
+        );
+
+    if (result != pdPASS)
+    {
+        printf(
+            "ERROR: InputTask creation failed\n"
+        );
+
+        return;
+    }
+
+    // --------------------------------------------
+    // DISPLAY TASK - CPU1
+    // --------------------------------------------
+
+    result =
+        xTaskCreatePinnedToCore(
+            displayTask,
+            "DisplayTask",
+            4096,
+            NULL,
+            1,
+            NULL,
+            1
+        );
+
+    if (result != pdPASS)
+    {
+        printf(
+            "ERROR: DisplayTask creation failed\n"
+        );
+
+        return;
+    }
+
+    // --------------------------------------------
+    // ALARM TASK - CPU1
+    // --------------------------------------------
+
+    result =
+        xTaskCreatePinnedToCore(
+            alarmTask,
+            "AlarmTask",
+            4096,
+            NULL,
+            1,
+            NULL,
+            1
+        );
+
+    if (result != pdPASS)
+    {
+        printf(
+            "ERROR: AlarmTask creation failed\n"
+        );
+
+        return;
+    }
+
+    printf(
+        "All tasks started successfully.\n"
     );
 }
