@@ -4,6 +4,7 @@ namespace
 {
     constexpr float LOW_TEMPERATURE_LIMIT = 18.0f;
     constexpr float HIGH_TEMPERATURE_LIMIT = 30.0f;
+
 }
 
 AlarmState evaluateTemperature(float temperature)

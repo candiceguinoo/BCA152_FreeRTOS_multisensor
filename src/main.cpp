@@ -938,17 +938,49 @@ void sensorTask(void *parameter)
 
         if (result == ESP_OK)
         {
-            sensorData.lightLevel =
-                (int)(
-                    (raw_value / 4095.0f)
-                    * 100.0f
-                );
+           // --------------------------------------------
+            // LDR LIGHT LEVEL
+            // 0 lux      -> 0%
+            // 100,000 lux -> 100%
+            // --------------------------------------------
 
+            const int LDR_RAW_MAX = 4095;
+
+            int reversedRaw = LDR_RAW_MAX - raw_value;
+
+            // Very low light = exactly 0%
+            if (reversedRaw <= 40)
+            {
+                sensorData.lightLevel = 0;
+            }
+            // Maximum light = exactly 100%
+            else if (reversedRaw >= 4000)
+            {
+                sensorData.lightLevel = 100;
+            }
+            // Normal range
+            else
+            {
+                sensorData.lightLevel =
+                    (int)(
+                        (reversedRaw / 4095.0f)
+                        * 100.0f
+                    );
+            }
+
+            // Safety limits
             if (sensorData.lightLevel < 0)
                 sensorData.lightLevel = 0;
 
             if (sensorData.lightLevel > 100)
                 sensorData.lightLevel = 100;
+
+            serialPrintf(
+                "LDR Raw: %d | Reversed: %d | Light Level: %d %%\n",
+                raw_value,
+                reversedRaw,
+                sensorData.lightLevel
+            );
         }
         else
         {
