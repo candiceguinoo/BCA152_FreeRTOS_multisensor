@@ -55,6 +55,39 @@
 #define INACTIVITY_TIMEOUT_US 15000000LL
 
 // ====================================================
+// TASK PRIORITIES - Part XII
+// ====================================================
+//
+// Higher number = more urgent. Priority expresses how quickly a
+// task must respond, NOT how "important" it is. Priorities only
+// compete between tasks pinned to the SAME core:
+//
+//   Core 0: MotionTask (3) preempts SensorTask (2)
+//   Core 1: InputTask (3) > AlarmTask (2) > DisplayTask (1)
+//
+// MotionTask  (3): tiny job every 100 ms; owns the inactivity timer
+//                  and wake-up, must never wait behind sensor work.
+// InputTask   (3): human input; encoder events must be consumed
+//                  before the 8-slot encoderQueue overflows.
+// SensorTask  (2): periodic, 2 s deadline; tolerates jitter but
+//                  should still preempt screen drawing.
+// AlarmTask   (2): runs briefly per sensor update; should preempt a
+//                  screen redraw so alarm handling is prompt.
+// DisplayTask (1): heaviest job (I2C redraw, tens of ms) and the
+//                  least time-critical; lowest priority means it can
+//                  never delay input or alarm handling.
+
+#define PRIORITY_MOTION  3
+#define PRIORITY_INPUT   3
+#define PRIORITY_SENSOR  2
+#define PRIORITY_ALARM   2
+#define PRIORITY_DISPLAY 1
+
+// Set to 1 to print how long the DHT22 read and OLED redraw take
+// (evidence for the priority justification). Set to 0 afterwards.
+#define ENABLE_TIMING_DEBUG 0
+
+// ====================================================
 // ENCODER SETTINGS
 // ====================================================
 
@@ -893,12 +926,25 @@ void sensorTask(void *parameter)
         float newHumidity =
             0.0f;
 
-        if (
+        #if ENABLE_TIMING_DEBUG
+        int64_t dhtStartUs =
+            esp_timer_get_time();
+#endif
+
+        bool dhtOk =
             dht22_read(
                 &newTemperature,
                 &newHumidity
-            )
-        )
+            );
+
+#if ENABLE_TIMING_DEBUG
+        serialPrintf(
+            "TIMING: DHT22 read took %lld us\n",
+            (long long)(esp_timer_get_time() - dhtStartUs)
+        );
+#endif
+
+        if (dhtOk)
         {
             sensorData.temperature =
                 newTemperature;
@@ -1632,10 +1678,22 @@ void displayTask(void *parameter)
         lastMotionShown =
             motionDetected;
 
+#if ENABLE_TIMING_DEBUG
+        int64_t drawStartUs =
+            esp_timer_get_time();
+#endif
+
         drawPage(
             currentMode,
             sensorData
         );
+
+#if ENABLE_TIMING_DEBUG
+        serialPrintf(
+            "TIMING: OLED redraw took %lld us\n",
+            (long long)(esp_timer_get_time() - drawStartUs)
+        );
+#endif
     }
 }
 
@@ -1922,13 +1980,13 @@ extern "C" void app_main(void)
     // --------------------------------------------
     //
     // CPU0:
-    // SensorTask
-    // MotionTask
+    // MotionTask  (priority 3)
+    // SensorTask  (priority 2)
     //
     // CPU1:
-    // InputTask
-    // DisplayTask
-    // AlarmTask
+    // InputTask   (priority 3)
+    // AlarmTask   (priority 2)
+    // DisplayTask (priority 1)
     //
     // --------------------------------------------
 
@@ -1944,7 +2002,7 @@ extern "C" void app_main(void)
             "SensorTask",
             6144,
             NULL,
-            2,
+            PRIORITY_SENSOR,
             NULL,
             0
         );
@@ -1968,7 +2026,7 @@ extern "C" void app_main(void)
             "MotionTask",
             4096,
             NULL,
-            2,
+            PRIORITY_MOTION,
             NULL,
             0
         );
@@ -1992,7 +2050,7 @@ extern "C" void app_main(void)
             "InputTask",
             4096,
             NULL,
-            2,
+            PRIORITY_INPUT,
             NULL,
             1
         );
@@ -2016,7 +2074,7 @@ extern "C" void app_main(void)
             "DisplayTask",
             4096,
             NULL,
-            1,
+            PRIORITY_DISPLAY,
             NULL,
             1
         );
@@ -2040,7 +2098,7 @@ extern "C" void app_main(void)
             "AlarmTask",
             4096,
             NULL,
-            1,
+            PRIORITY_ALARM,
             NULL,
             1
         );
