@@ -16,6 +16,7 @@
 #include "input.h"
 #include "system_state.h"
 #include "rtos_objects.h"
+#include "motion.h"
 
 
 #include "driver/gpio.h"
@@ -1054,181 +1055,6 @@ if (haveValidDhtReading)
 
 
 // ====================================================
-// MOTION TASK
-// ====================================================
-
-
-void motionTask(void *parameter)
-{
-    gpio_set_direction(
-         PIR_PIN,
-         GPIO_MODE_INPUT
-    );
-
-
-    gpio_pulldown_en(PIR_PIN);
-
-
-    int64_t lastMotionTime =
-         esp_timer_get_time();
-
-
-    bool lastPirLevel =
-         false;
-
-
-    serialPrintf(
-         "MotionTask: Started on CPU %d\n",
-         xPortGetCoreID()
-    );
-
-
-    while (1)
-
-{
-    bool pirLevel =
-        gpio_get_level(PIR_PIN) != 0;
-
-
-    int64_t now =
-        esp_timer_get_time();
-
-
-    // --------------------------------------------
-    // PIR ACTIVITY
-    // --------------------------------------------
-
-
-    if (pirLevel)
-    {
-        lastMotionTime =
-            now;
-
-
-        motionDetected =
-            true;
-
-
-        if (!lastPirLevel)
-        {
-            serialPrintf(
-                 "MotionTask: MOTION DETECTED\n"
-            );
-
-
-            xEventGroupSetBits(
-                 systemEvents,
-                 EVENT_MOTION
-            );
-
-
-            serialPrintf(
-                 "EVENT_MOTION SET\n"
-            );
-
-
-            xEventGroupSetBits(
-                 systemEvents,
-                 EVENT_ACTIVE
-            );
-
-
-            serialPrintf(
-
-              "EVENT_ACTIVE SET\n"
-         );
-    }
-
-
-    if (systemState == SystemState::INACTIVE)
-    {
-         systemState =
-              SystemState::ACTIVE;
-
-
-         serialPrintf(
-              "System entering ACTIVE mode\n"
-         );
-    }
-}
-
-
-lastPirLevel =
-    pirLevel;
-
-
-// --------------------------------------------
-// INACTIVITY TIMEOUT
-// --------------------------------------------
-
-
-if (
-    systemState == SystemState::ACTIVE &&
-    (now - lastMotionTime) >= INACTIVITY_TIMEOUT_US
-)
-{
-    motionDetected =
-         false;
-
-
-    systemState =
-         SystemState::INACTIVE;
-
-
-    serialPrintf(
-         "MotionTask: NO MOTION - "
-         "15 SECOND TIMEOUT\n"
-    );
-
-
-    serialPrintf(
-         "System entering INACTIVE mode\n"
-
-             );
-
-
-             xEventGroupClearBits(
-                  systemEvents,
-                  EVENT_ACTIVE
-             );
-
-
-             serialPrintf(
-                  "EVENT_ACTIVE CLEARED\n"
-             );
-
-
-             xEventGroupClearBits(
-                  systemEvents,
-                  EVENT_MOTION
-             );
-
-
-             serialPrintf(
-                  "EVENT_MOTION CLEARED\n"
-             );
-
-
-             xEventGroupClearBits(
-                  systemEvents,
-                  EVENT_ALARM
-             );
-
-
-             serialPrintf(
-                  "EVENT_ALARM CLEARED - system inactive\n"
-             );
-        }
-
-
-        vTaskDelay(
-             ms_to_ticks(100)
-        );
-    }
-}
-
-
-// ====================================================
 // ENCODER INTERRUPT
 // ====================================================
 
@@ -2166,15 +1992,7 @@ gpio_pullup_en(
 // --------------------------------------------
 
 
-gpio_set_direction(
-     PIR_PIN,
-     GPIO_MODE_INPUT
-);
-
-
-gpio_pulldown_en(
-     PIR_PIN
-);
+motionInit();
 
 
 // --------------------------------------------
