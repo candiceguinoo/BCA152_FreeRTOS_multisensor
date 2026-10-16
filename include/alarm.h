@@ -1,9 +1,10 @@
+
 #ifndef ALARM_H
 #define ALARM_H
 
 // ----------------------------------------------------
-// Pure decision logic (alarm.cpp, top part) - no ESP-IDF includes,
-// unit testable on a PC.
+// Pure decision logic (alarm.cpp, top part)
+// No ESP-IDF includes; unit testable on a PC.
 // ----------------------------------------------------
 
 enum class AlarmState
@@ -21,10 +22,15 @@ const char *alarmStateToString(AlarmState state);
 // Hardware / task side (alarm.cpp, bottom part)
 // ----------------------------------------------------
 
-// Configure the buzzer output (silent). Call once from app_main.
+#ifndef PIO_UNIT_TESTING
+
+// Configure the buzzer output (silent).
+// Call once from app_main.
 void alarmInit();
 
-// AlarmTask: evaluates temperature, owns the buzzer.
+// AlarmTask: evaluates temperature and owns the buzzer.
 void alarmTask(void *parameter);
+
+#endif // PIO_UNIT_TESTING
 
 #endif // ALARM_H
