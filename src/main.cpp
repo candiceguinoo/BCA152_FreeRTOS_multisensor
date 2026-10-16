@@ -78,6 +78,7 @@
 
 // ====================================================
 // ENCODER SETTINGS
+
 // ====================================================
 
 
@@ -118,6 +119,7 @@ static void oled_command(uint8_t command)
              OLED_ADDR,
              data,
              sizeof(data),
+
              pdMS_TO_TICKS(100)
         );
 
@@ -158,6 +160,7 @@ static void oled_data(const uint8_t *data, size_t length)
 
 
 static void oled_init()
+
 {
     i2c_config_t config = {};
 
@@ -198,6 +201,7 @@ static void oled_init()
              "i2c_driver_install failed: %s\n",
              esp_err_to_name(err)
         );
+
     }
 
 
@@ -238,6 +242,7 @@ static void oled_power(bool on)
 }
 
 static void oled_clear()
+
 {
     uint8_t blank[128] = {0};
 
@@ -278,6 +283,7 @@ break;
          case 'B': p[0]=0x7F; p[1]=0x49; p[2]=0x49; p[3]=0x49; p[4]=0x36;
 break;
          case 'C': p[0]=0x3E; p[1]=0x41; p[2]=0x41; p[3]=0x41; p[4]=0x22;
+
 break;
          case 'D': p[0]=0x7F; p[1]=0x41; p[2]=0x41; p[3]=0x22; p[4]=0x1C;
 break;
@@ -318,6 +324,7 @@ break;
 break;
          case 'V': p[0]=0x1F; p[1]=0x20; p[2]=0x40; p[3]=0x20; p[4]=0x1F;
 break;
+
          case 'W': p[0]=0x7F; p[1]=0x20; p[2]=0x18; p[3]=0x20; p[4]=0x7F;
 break;
          case 'X': p[0]=0x63; p[1]=0x14; p[2]=0x08; p[3]=0x14; p[4]=0x63;
@@ -438,6 +445,7 @@ static void oled_text_big(int x, int page, const char *text)
     {
         oled_char_big(x, page, *text);
         x += 12;
+
         text++;
     }
 }
@@ -518,6 +526,7 @@ bool responseLow =
 
 
 if (responseLow)
+
 {
     start =
         esp_timer_get_time();
@@ -558,6 +567,7 @@ if (responseLow && responseHigh)
     }
 
 bool firstBitStarted =
+
     (gpio_get_level(DHT_PIN) == 0);
 
 
@@ -598,6 +608,7 @@ if (firstBitStarted)
             if (
                   (esp_timer_get_time() - highStart)
                   > DHT_BIT_TIMEOUT_US
+
             )
             {
                   readOK = false;
@@ -638,6 +649,7 @@ if (firstBitStarted)
 
 
 if (readOK)
+
 {
     uint8_t checksum =
         (uint8_t)(
@@ -718,6 +730,7 @@ else
                              "(calc=%u received=%u)\n",
                              checksum,
                              data[4]
+
                         );
                    }
             }
@@ -797,6 +810,7 @@ void sensorTask(void *parameter)
               &init_config,
               &adc_handle
          );
+
 
 if (result != ESP_OK)
 {
@@ -878,6 +892,7 @@ sensorData.humidity = 0.0f;
 
          bool dhtOk =
               dht22_read(
+
                    &newTemperature,
                    &newHumidity
               );
@@ -918,6 +933,7 @@ else
     {
            serialPrintf(
                 "DHT22 reading failed - "
+
                 "no valid reading yet\n"
            );
     }
@@ -958,6 +974,7 @@ if (reversedRaw <= 40)
 }
 // Maximum light = exactly 100%
 else if (reversedRaw >= 4000)
+
 {
        sensorData.lightLevel = 100;
 }
@@ -1055,229 +1072,6 @@ if (haveValidDhtReading)
 
 
 // ====================================================
-// ENCODER INTERRUPT
-// ====================================================
-
-static void IRAM_ATTR encoderIsr(void *arg)
-{
-    int8_t direction =
-         (gpio_get_level(ENCODER_DT) != 0)
-             ? 1
-             : -1;
-
-
-    if (ENCODER_REVERSE)
-         direction = -direction;
-
-
-    BaseType_t higherPriorityTaskWoken =
-         pdFALSE;
-
-
-    xQueueSendFromISR(
-         encoderQueue,
-         &direction,
-         &higherPriorityTaskWoken
-    );
-
-
-    if (higherPriorityTaskWoken == pdTRUE)
-    {
-         portYIELD_FROM_ISR();
-    }
-}
-
-
-// ====================================================
-// INPUT TASK
-// ====================================================
-
-
-void inputTask(void *parameter)
-{
-    gpio_set_direction(
-         ENCODER_CLK,
-         GPIO_MODE_INPUT
-    );
-
-
-    gpio_set_direction(
-         ENCODER_DT,
-         GPIO_MODE_INPUT
-    );
-
-gpio_set_direction(
-       ENCODER_SW,
-       GPIO_MODE_INPUT
-);
-
-
-gpio_pullup_en(
-       ENCODER_CLK
-);
-
-
-gpio_pullup_en(
-       ENCODER_DT
-);
-
-
-gpio_pullup_en(
-       ENCODER_SW
-);
-
-
-gpio_set_intr_type(
-       ENCODER_CLK,
-       GPIO_INTR_NEGEDGE
-);
-
-
-esp_err_t err =
-       gpio_install_isr_service(0);
-
-
-if (
-       err != ESP_OK &&
-       err != ESP_ERR_INVALID_STATE
-)
-{
-       serialPrintf(
-            "gpio_install_isr_service failed: %s\n",
-            esp_err_to_name(err)
-       );
-}
-
-
-gpio_isr_handler_add(
-       ENCODER_CLK,
-       encoderIsr,
-
-     NULL
-);
-
-
-DisplayMode currentMode =
-     DisplayMode::TEMPERATURE;
-
-
-bool lastButton =
-     gpio_get_level(
-          ENCODER_SW
-     );
-
-
-serialPrintf(
-     "InputTask: Started on CPU %d\n",
-     xPortGetCoreID()
-);
-
-
-while (1)
-{
-     // --------------------------------------------
-     // ROTATION
-     // --------------------------------------------
-
-
-     int8_t direction = 0;
-
-
-     if (
-          xQueueReceive(
-              encoderQueue,
-              &direction,
-              ms_to_ticks(20)
-          ) == pdPASS
-     )
-     {
-          // Encoder is active only when EVENT_ACTIVE is set.
-          EventBits_t events =
-              xEventGroupGetBits(systemEvents);
-
-
-          if (events & EVENT_ACTIVE)
-          {
-              if (direction > 0)
-              {
-
-              currentMode =
-                   nextDisplayMode(currentMode);
-
-
-              serialPrintf(
-                   "InputTask: clockwise -> %s\n",
-                   displayModeToString(currentMode)
-              );
-         }
-         else
-         {
-              currentMode =
-                   previousDisplayMode(currentMode);
-
-
-              serialPrintf(
-                   "InputTask: counter-clockwise -> %s\n",
-                   displayModeToString(currentMode)
-              );
-         }
-
-
-         xQueueOverwrite(
-              modeQueue,
-              &currentMode
-         );
-    }
-}
-
-
-// --------------------------------------------
-// ENCODER BUTTON
-// --------------------------------------------
-
-
-bool currentButton =
-    gpio_get_level(
-         ENCODER_SW
-    );
-
-
-if (
-    lastButton == 1 &&
-    currentButton == 0 &&
-    (xEventGroupGetBits(systemEvents) & EVENT_ACTIVE)
-)
-
-        {
-             currentMode =
-                  nextDisplayMode(currentMode);
-
-
-             xQueueOverwrite(
-                  modeQueue,
-                  &currentMode
-             );
-
-
-             serialPrintf(
-                  "InputTask: button pressed -> %s\n",
-                  displayModeToString(currentMode)
-             );
-
-
-             vTaskDelay(
-                  ms_to_ticks(200)
-             );
-        }
-
-
-        lastButton =
-             currentButton;
-    }
-}
-
-
-// ====================================================
 // DISPLAY PAGE DRAWING
 // ====================================================
 
@@ -1318,6 +1112,7 @@ switch (mode)
              sizeof(line),
              "%.1f C",
              data.temperature
+
         );
 
 
@@ -1358,6 +1153,7 @@ switch (mode)
 
 
    oled_text_big(
+
         0,
         5,
         line
@@ -1438,6 +1234,7 @@ case DisplayMode::LIGHT:
 
 
            break;
+
     }
 }
 
@@ -1478,6 +1275,7 @@ void displayTask(void *parameter)
          if (
              xQueueReceive(
                    displayQueue,
+
                    &sensorData,
                    ms_to_ticks(20)
              ) == pdPASS
@@ -1638,6 +1436,7 @@ if (
 
 static void buzzer_init()
 
+
 {
     ledc_timer_config_t timer = {};
     timer.speed_mode          = BUZZER_LEDC_MODE;
@@ -1678,6 +1477,7 @@ static void buzzer_on(uint32_t frequencyHz)
 
     ledc_update_duty(
          BUZZER_LEDC_MODE,
+
          BUZZER_LEDC_CHANNEL
     );
 }
@@ -1718,6 +1518,7 @@ static uint32_t buzzerFrequencyFor(AlarmState state)
 
 
 void alarmTask(void *parameter)
+
 {
      SensorData sensorData = {};
 
@@ -1758,6 +1559,7 @@ while (1)
          ) != pdPASS
      )
      {
+
          // Timeout: only happens while an alarm is sounding.
          if (
              (xEventGroupGetBits(systemEvents)
@@ -1798,6 +1600,7 @@ while (1)
 
 
 // Alarm is active only when EVENT_ACTIVE is set.
+
 if (
     (xEventGroupGetBits(systemEvents)
        & EVENT_ACTIVE) == 0
@@ -1878,6 +1681,7 @@ else
 
          serialPrintf(
               "EVENT_ALARM CLEARED\n"
+
          );
     }
 }
@@ -1918,6 +1722,7 @@ if (
 
                           (unsigned)buzzerFrequencyFor(state)
                      );
+
               }
               else
               {
@@ -1958,6 +1763,7 @@ extern "C" void app_main(void)
 
 
     serialPrintf(
+
           "BCA152 FreeRTOS Multisensor\n"
     );
 
@@ -2038,6 +1844,7 @@ serialPrintf(
 // SensorTask    (priority 2)
 //
 // CPU1:
+
 // InputTask     (priority 3)
 // AlarmTask     (priority 2)
 // DisplayTask (priority 1)
@@ -2078,6 +1885,7 @@ if (result != pdPASS)
 
 
 // --------------------------------------------
+
 // MOTION TASK
 // --------------------------------------------
 
@@ -2118,6 +1926,7 @@ result =
          4096,
          NULL,
          PRIORITY_INPUT,
+
          NULL,
          1
     );
@@ -2158,6 +1967,7 @@ if (result != pdPASS)
 
 
     return;
+
 }
 
 
