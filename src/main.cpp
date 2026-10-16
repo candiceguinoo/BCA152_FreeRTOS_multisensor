@@ -15,6 +15,7 @@
 #include "sensors.h"
 #include "input.h"
 #include "system_state.h"
+#include "rtos_objects.h"
 
 
 #include "driver/gpio.h"
@@ -75,144 +76,11 @@
 
 
 // ====================================================
-// TASK PRIORITIES - Part XII
-// ====================================================
-//
-// Higher number = more urgent. Priority expresses how quickly a
-// task must respond, NOT how "important" it is. Priorities only
-// compete between tasks pinned to the SAME core:
-//
-//   Core 0: MotionTask (3) preempts SensorTask (2)
-//   Core 1: InputTask (3) > AlarmTask (2) > DisplayTask (1)
-//
-// MotionTask   (3): tiny job every 100 ms; owns the inactivity timer
-//                   and wake-up, must never wait behind sensor work.
-
-// InputTask     (3): human input; encoder events must be consumed
-//                    before the 8-slot encoderQueue overflows.
-// SensorTask    (2): periodic, 2 s deadline; tolerates jitter but
-//                    should still preempt screen drawing.
-// AlarmTask     (2): runs briefly per sensor update; should preempt a
-//                    screen redraw so alarm handling is prompt.
-// DisplayTask (1): heaviest job (I2C redraw, tens of ms) and the
-//                    least time-critical; lowest priority means it can
-//                    never delay input or alarm handling.
-
-
-#define PRIORITY_MOTION    3
-#define PRIORITY_INPUT     3
-#define PRIORITY_SENSOR    2
-#define PRIORITY_ALARM     2
-#define PRIORITY_DISPLAY 1
-
-
-// Set to 1 to print how long the DHT22 read and OLED redraw take
-// (evidence for the priority justification). Set to 0 afterwards.
-#define ENABLE_TIMING_DEBUG 0
-
-
-// ====================================================
 // ENCODER SETTINGS
 // ====================================================
 
 
 constexpr bool ENCODER_REVERSE = false;
-
-
-// ====================================================
-// QUEUES
-// ====================================================
-
-
-QueueHandle_t displayQueue;
-QueueHandle_t alarmQueue;
-QueueHandle_t modeQueue;
-QueueHandle_t encoderQueue;
-
-
-// ====================================================
-// SERIAL MUTEX - Part XI
-// ====================================================
-
-
-SemaphoreHandle_t serialMutex = NULL;
-
-
-// ====================================================
-// EVENT GROUP - Part X
-// ====================================================
-//
-
-// EVENT_ACTIVE:
-//     Producer: app_main / MotionTask
-//     Consumers: DisplayTask / InputTask / AlarmTask
-//     Set: system startup or motion detected
-//     Clear: 15-second inactivity timeout
-//
-// EVENT_MOTION:
-//     Producer: MotionTask
-//     Consumer: DisplayTask
-//     Set: PIR detects motion
-//     Clear: 15-second inactivity timeout
-//
-// EVENT_ALARM:
-//     Producer: AlarmTask
-//     Consumer: DisplayTask
-//     Set: LOW_TEMPERATURE or HIGH_TEMPERATURE
-//     Clear: NORMAL temperature or system inactive
-//
-
-
-#define EVENT_ACTIVE BIT0
-#define EVENT_MOTION BIT1
-#define EVENT_ALARM   BIT2
-
-
-EventGroupHandle_t systemEvents = NULL;
-
-
-// ====================================================
-// HELPERS
-// ====================================================
-
-
-static inline TickType_t ms_to_ticks(uint32_t ms)
-{
-     TickType_t ticks = pdMS_TO_TICKS(ms);
-
-    return (ticks == 0) ? 1 : ticks;
-}
-
-
-// ====================================================
-// SERIAL OUTPUT HELPER
-// ====================================================
-
-
-static void serialPrintf(const char *format, ...)
-{
-    va_list args;
-
-
-    va_start(args, format);
-
-
-    if (
-           serialMutex != NULL &&
-           xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE
-    )
-    {
-           vprintf(format, args);
-           xSemaphoreGive(serialMutex);
-    }
-    else
-    {
-           vprintf(format, args);
-    }
-
-
-    va_end(args);
-}
 
 
 // ====================================================
@@ -2318,123 +2186,13 @@ buzzer_init();
 
 
 // --------------------------------------------
-// CREATE QUEUES
+// CREATE FREERTOS OBJECTS
 // --------------------------------------------
 
-displayQueue =
-       xQueueCreate(
-            1,
-            sizeof(SensorData)
-       );
-
-
-alarmQueue =
-       xQueueCreate(
-            1,
-            sizeof(SensorData)
-       );
-
-
-modeQueue =
-       xQueueCreate(
-            1,
-            sizeof(DisplayMode)
-       );
-
-
-encoderQueue =
-       xQueueCreate(
-            8,
-            sizeof(int8_t)
-       );
-
-
-if (
-       displayQueue == NULL ||
-       alarmQueue == NULL ||
-       modeQueue == NULL ||
-       encoderQueue == NULL
-)
+if (!rtosObjectsCreate())
 {
-       serialPrintf(
-            "ERROR: Failed to create queues\n"
-       );
-
-
-       return;
+    return;
 }
-
-
-serialPrintf(
-
-     "Queues created successfully.\n"
-);
-
-
-// --------------------------------------------
-// CREATE EVENT GROUP - Part X
-// --------------------------------------------
-
-
-systemEvents =
-     xEventGroupCreate();
-
-
-if (systemEvents == NULL)
-{
-     serialPrintf(
-          "ERROR: Failed to create Event Group\n"
-     );
-
-
-     return;
-}
-
-
-serialPrintf(
-     "Event Group created successfully.\n"
-);
-
-
-serialPrintf(
-     "EVENT_ACTIVE = BIT0\n"
-);
-
-
-serialPrintf(
-     "EVENT_MOTION = BIT1\n"
-);
-
-
-serialPrintf(
-     "EVENT_ALARM = BIT2\n"
-);
-
-
-// --------------------------------------------
-// CREATE SERIAL MUTEX - Part XI
-// --------------------------------------------
-
-
-serialMutex =
-
-     xSemaphoreCreateMutex();
-
-
-if (serialMutex == NULL)
-{
-     serialPrintf(
-          "ERROR: Failed to create serial mutex\n"
-     );
-
-
-     return;
-}
-
-
-serialPrintf(
-     "Serial mutex created successfully.\n"
-);
 
 
 // --------------------------------------------
