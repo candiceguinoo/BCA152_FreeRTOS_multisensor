@@ -1,4 +1,3 @@
-
 #include "alarm.h"
 
 // ====================================================
@@ -61,14 +60,19 @@ const char *alarmStateToString(AlarmState state)
 #define BUZZER_LEDC_MODE        LEDC_LOW_SPEED_MODE
 #define BUZZER_LEDC_TIMER       LEDC_TIMER_0
 #define BUZZER_LEDC_CHANNEL     LEDC_CHANNEL_0
-#define BUZZER_DUTY_ON          512
-#define BUZZER_FREQ_HIGH_TEMP   2000
-#define BUZZER_FREQ_LOW_TEMP    800
-#define BUZZER_BEEP_MS          250
+#define BUZZER_DUTY_ON          512     // 50% of 10-bit range
+#define BUZZER_FREQ_HIGH_TEMP   2000    // Hz: high-pitched = too hot
+#define BUZZER_FREQ_LOW_TEMP    800     // Hz: low-pitched  = too cold
+#define BUZZER_BEEP_MS          250     // on/off time of each beep
 
 // ====================================================
 // BUZZER DRIVER
 // ====================================================
+//
+// Only AlarmTask calls buzzer_on()/buzzer_off() after startup, so
+// the buzzer has a single owner and needs no mutex. The alarm
+// DECISION lives in alarm.cpp (evaluateTemperature); this section
+// only turns a decision into sound.
 
 static void buzzer_init()
 {
@@ -81,13 +85,12 @@ static void buzzer_init()
     ledc_timer_config(&timer);
 
     ledc_channel_config_t channel = {};
-    channel.gpio_num    = BUZZER_PIN;
-    channel.speed_mode  = BUZZER_LEDC_MODE;
-    channel.channel     = BUZZER_LEDC_CHANNEL;
-    channel.intr_type   = LEDC_INTR_DISABLE;
-    channel.timer_sel   = BUZZER_LEDC_TIMER;
-    channel.duty        = 0;
-    channel.hpoint      = 0;
+    channel.gpio_num   = BUZZER_PIN;
+    channel.speed_mode = BUZZER_LEDC_MODE;
+    channel.channel    = BUZZER_LEDC_CHANNEL;
+    channel.timer_sel  = BUZZER_LEDC_TIMER;
+    channel.duty       = 0;   // silent at startup
+    channel.hpoint     = 0;
     ledc_channel_config(&channel);
 }
 
@@ -135,15 +138,31 @@ static uint32_t buzzerFrequencyFor(AlarmState state)
 // ====================================================
 // ALARM TASK
 // ====================================================
+//
+// ACTIVE:
+//   Blocks on alarmQueue. While the temperature is normal it waits
+//   forever for the next reading. While an alarm is sounding it wakes
+//   every BUZZER_BEEP_MS (queue timeout) to toggle the beep.
+//
+// INACTIVE:
+//   Silences the buzzer, then sleeps on the event group until
+//   MotionTask sets EVENT_ACTIVE again (no polling). SensorTask keeps
+//   overwriting alarmQueue meanwhile, so on wake-up the newest reading
+//   is already waiting and the alarm is re-evaluated immediately,
+//   without waiting for the next 2 s sensor cycle.
 
 void alarmTask(void *parameter)
 {
-    (void)parameter;
-
     SensorData sensorData = {};
 
-    AlarmState lastState = AlarmState::NORMAL;
-    AlarmState soundingState = AlarmState::NORMAL;
+    bool haveData = false;      // true once any reading has arrived
+
+    AlarmState lastState =
+        AlarmState::NORMAL;
+
+    // Alarm currently being signalled (NORMAL = silent).
+    AlarmState soundingState =
+        AlarmState::NORMAL;
 
     bool beepOn = false;
     bool firstEvaluation = true;
@@ -155,59 +174,15 @@ void alarmTask(void *parameter)
 
     while (1)
     {
-        TickType_t waitTime =
-            (soundingState == AlarmState::NORMAL)
-                ? portMAX_DELAY
-                : pdMS_TO_TICKS(BUZZER_BEEP_MS);
+        EventBits_t events =
+            xEventGroupGetBits(systemEvents);
 
-        if (
-            xQueueReceive(
-                alarmQueue,
-                &sensorData,
-                waitTime
-            ) != pdPASS
-        )
+        if ((events & EVENT_ACTIVE) == 0)
         {
-            // Timeout: only happens while an alarm is sounding.
-            if (
-                (xEventGroupGetBits(systemEvents)
-                 & EVENT_ACTIVE) == 0
-            )
-            {
-                buzzer_off();
-                beepOn = false;
-                soundingState = AlarmState::NORMAL;
-                firstEvaluation = true;
+            // --------------------------------------------
+            // INACTIVE: silence, then sleep until ACTIVE
+            // --------------------------------------------
 
-                serialPrintf(
-                    "Buzzer: OFF - system inactive\n"
-                );
-            }
-            else
-            {
-                beepOn = !beepOn;
-
-                if (beepOn)
-                {
-                    buzzer_on(
-                        buzzerFrequencyFor(soundingState)
-                    );
-                }
-                else
-                {
-                    buzzer_off();
-                }
-            }
-
-            continue;
-        }
-
-        // Alarm is active only when EVENT_ACTIVE is set.
-        if (
-            (xEventGroupGetBits(systemEvents)
-             & EVENT_ACTIVE) == 0
-        )
-        {
             xEventGroupClearBits(
                 systemEvents,
                 EVENT_ALARM
@@ -225,13 +200,101 @@ void alarmTask(void *parameter)
             }
 
             firstEvaluation = true;
-            continue;
+
+            xEventGroupWaitBits(
+                systemEvents,
+                EVENT_ACTIVE,
+                pdFALSE,        // do not clear the bit on exit
+                pdFALSE,        // any one of the bits is enough
+                portMAX_DELAY
+            );
+
+            // ACTIVE again: take the newest reading right away.
+            if (
+                xQueueReceive(
+                    alarmQueue,
+                    &sensorData,
+                    0
+                ) == pdPASS
+            )
+            {
+                haveData = true;
+            }
+
+            if (!haveData)
+            {
+                continue;
+            }
+        }
+        else
+        {
+            // --------------------------------------------
+            // ACTIVE: wait for a reading (or the next beep)
+            // --------------------------------------------
+
+            TickType_t waitTime =
+                (soundingState == AlarmState::NORMAL)
+                    ? portMAX_DELAY
+                    : pdMS_TO_TICKS(BUZZER_BEEP_MS);
+
+            if (
+                xQueueReceive(
+                    alarmQueue,
+                    &sensorData,
+                    waitTime
+                ) != pdPASS
+            )
+            {
+                // Timeout: only happens while an alarm is sounding.
+                // If the system just went INACTIVE, do not beep; the
+                // top of the loop silences the buzzer.
+                if (
+                    xEventGroupGetBits(systemEvents)
+                    & EVENT_ACTIVE
+                )
+                {
+                    beepOn = !beepOn;
+
+                    if (beepOn)
+                    {
+                        buzzer_on(
+                            buzzerFrequencyFor(soundingState)
+                        );
+                    }
+                    else
+                    {
+                        buzzer_off();
+                    }
+                }
+
+                continue;
+            }
+
+            haveData = true;
+
+            // The system may have gone INACTIVE while we waited.
+            if (
+                (xEventGroupGetBits(systemEvents)
+                 & EVENT_ACTIVE) == 0
+            )
+            {
+                continue;
+            }
         }
 
-        AlarmState state =
-            evaluateTemperature(sensorData.temperature);
+        // ------------------------------------------------
+        // EVALUATE the reading in sensorData
+        // ------------------------------------------------
 
+        AlarmState state =
+            evaluateTemperature(
+                sensorData.temperature
+            );
+
+        // --------------------------------------------
         // UPDATE EVENT_ALARM
+        // --------------------------------------------
+
         EventBits_t currentEvents =
             xEventGroupGetBits(systemEvents);
 
@@ -241,14 +304,18 @@ void alarmTask(void *parameter)
 
         if (alarmActive)
         {
-            if ((currentEvents & EVENT_ALARM) == 0)
+            if (
+                (currentEvents & EVENT_ALARM) == 0
+            )
             {
                 xEventGroupSetBits(
                     systemEvents,
                     EVENT_ALARM
                 );
 
-                serialPrintf("EVENT_ALARM SET\n");
+                serialPrintf(
+                    "EVENT_ALARM SET\n"
+                );
             }
         }
         else
@@ -260,12 +327,20 @@ void alarmTask(void *parameter)
                     EVENT_ALARM
                 );
 
-                serialPrintf("EVENT_ALARM CLEARED\n");
+                serialPrintf(
+                    "EVENT_ALARM CLEARED\n"
+                );
             }
         }
 
+        // --------------------------------------------
         // ALARM STATE CHANGE -> BUZZER
-        if (firstEvaluation || state != lastState)
+        // --------------------------------------------
+
+        if (
+            firstEvaluation ||
+            state != lastState
+        )
         {
             serialPrintf(
                 "Alarm State: %s (%.1f C)\n",
@@ -291,12 +366,16 @@ void alarmTask(void *parameter)
             else
             {
                 beepOn = false;
+
                 buzzer_off();
 
-                serialPrintf("Buzzer: OFF\n");
+                serialPrintf(
+                    "Buzzer: OFF\n"
+                );
             }
 
             lastState = state;
+
             firstEvaluation = false;
         }
     }
