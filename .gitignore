@@ -5,3 +5,5 @@
 .vscode/ipch
 
 .vscode/settings.json
+
+sdkconfig.esp32dev
